@@ -850,7 +850,7 @@ const resizeObserver = new ResizeObserver(() => {
     </div>
 {isMeetingOpen &&
   (isMeetingOnlyMode ? (
-    <div className="mt-3 flex w-full items-center justify-center">
+    <div className="mt-3 flex w-full justify-center">
       <MeetingMode
         onClose={closeMeetingMode}
         onMeetingSaved={onMeetingSaved}
@@ -859,7 +859,7 @@ const resizeObserver = new ResizeObserver(() => {
       />
     </div>
   ) : (
-    <div className="mt-3 flex items-center justify-center rounded-2xl border border-white/15 bg-black/50 p-4 backdrop-blur-sm">
+    <div className="mt-3 flex w-full justify-center rounded-2xl border border-white/15 bg-black/50 p-4 backdrop-blur-sm">
       <MeetingMode
         onClose={closeMeetingMode}
         onMeetingSaved={onMeetingSaved}
@@ -869,7 +869,7 @@ const resizeObserver = new ResizeObserver(() => {
     </div>
   ))}
        {!isMeetingOnlyMode && isResourcesOpen && (
-  <div className="mt-3 flex items-center justify-center rounded-2xl border border-white/15 bg-black/50 p-4 backdrop-blur-sm">
+  <div className="mt-3 w-full rounded-2xl border border-white/15 bg-black/50 p-4 backdrop-blur-sm">
     <Resources onClose={() => setIsResourcesOpen(false)} />
   </div>
 )}

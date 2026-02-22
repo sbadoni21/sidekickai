@@ -330,7 +330,7 @@ const App: React.FC = () => {
 
   if (!currentUser) {
     return (
-      <div ref={containerRef} className="min-h-0 relative">
+      <div ref={containerRef} className="min-h-0 relative app-window-shell">
         <Auth
           onAuthenticated={(user) => {
             setCurrentUser(user)
@@ -344,7 +344,7 @@ const App: React.FC = () => {
   }
 
   return (
-    <div ref={containerRef} className="min-h-0 relative">
+    <div ref={containerRef} className="min-h-0 relative app-window-shell">
       <QueryClientProvider client={queryClient}>
         <ToastProvider>
           {view === "dashboard" ? (

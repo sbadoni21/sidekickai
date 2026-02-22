@@ -171,6 +171,33 @@ const DEFAULT_RESOURCE_SCOPE_SELECTION: ResourceScopeSelection = {
 
 const RESOURCE_SCOPE_KEY_PREFIX = "cluely_meeting_resource_scope_v1_";
 
+type MeetingSttProviderChoice = "auto" | "elevenlabs" | "google" | "groq" | "puter";
+
+const STT_PROVIDER_KEY_PREFIX = "cluely_meeting_stt_provider_v1_";
+
+const normalizeSttProviderChoice = (value: unknown): MeetingSttProviderChoice => {
+  if (
+    value === "auto" ||
+    value === "elevenlabs" ||
+    value === "google" ||
+    value === "groq" ||
+    value === "puter"
+  ) {
+    return value;
+  }
+  return "auto";
+};
+
+const parseConfiguredSttProvider = (value: unknown): MeetingSttProviderChoice => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "elevenlabs" || normalized === "google" || normalized === "groq" || normalized === "puter") {
+    return normalized;
+  }
+  return "elevenlabs";
+};
+
 const normalizeResourceScopeSelection = (
   value: Partial<ResourceScopeSelection> | null | undefined
 ): ResourceScopeSelection => ({
@@ -206,9 +233,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   endRequestToken = 0,
   compact = false
 }) => {
-  const sttProvider = (import.meta.env.VITE_STT_PROVIDER || "elevenlabs").toLowerCase();
-  const useStreamingStt = sttProvider === "google" || sttProvider === "elevenlabs";
-  const useChunkedStt = !useStreamingStt;
+  const envDefaultSttProvider = parseConfiguredSttProvider(import.meta.env.VITE_STT_PROVIDER);
 
   const [meeting, setMeeting] = useState<Meeting | null>(null);
   const [meetingTitle, setMeetingTitle] = useState("");
@@ -226,12 +251,26 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const [resourceScopeSelection, setResourceScopeSelection] = useState<ResourceScopeSelection>(() =>
     loadResourceScopeSelection()
   );
+  const [selectedSttProvider, setSelectedSttProvider] = useState<MeetingSttProviderChoice>(() => {
+    try {
+      const user = getCurrentUser();
+      if (!user) return "auto";
+      const raw = localStorage.getItem(`${STT_PROVIDER_KEY_PREFIX}${user.id}`);
+      return normalizeSttProviderChoice(raw);
+    } catch {
+      return "auto";
+    }
+  });
   const [cpuMode, setCpuMode] = useState<CpuMode>("balanced");
   const [chunkRateMs, setChunkRateMs] = useState<number>(1800);
   const [maxChunkQueue, setMaxChunkQueue] = useState<number>(8);
   const [answerThrottleMs, setAnswerThrottleMs] = useState<number>(1200);
   const [modelThrottleMs, setModelThrottleMs] = useState<number>(800);
   const [cloudOffload] = useState<boolean>(true);
+
+  const resolvedSttProvider = selectedSttProvider === "auto" ? envDefaultSttProvider : selectedSttProvider;
+  const useStreamingStt = resolvedSttProvider === "google" || resolvedSttProvider === "elevenlabs";
+  const useChunkedStt = !useStreamingStt;
 
   const answerInFlightRef = useRef(false);
   const pendingAnswerRef = useRef<QuestionCandidate | null>(null);
@@ -252,6 +291,8 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const cloudOffloadAttemptedRef = useRef(false);
   const lastHandledEndRequestRef = useRef(0);
   const vectorLookupWarningShownRef = useRef(false);
+  const puterScriptPromiseRef = useRef<Promise<void> | null>(null);
+  const puterReadyRef = useRef(false);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -286,6 +327,101 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     const log: LogEntry = { timestamp: Date.now(), level, message };
     setLogs((prev) => [...prev.slice(-80), log]);
     console.log(`[${level.toUpperCase()}]`, message);
+  };
+
+  const getConfiguredSttProviderChain = (provider: MeetingSttProviderChoice): string[] => {
+    if (provider === "auto") return [];
+    if (provider === "puter") return ["puter", "groq", "elevenlabs"];
+    if (provider === "groq") return ["groq", "puter", "elevenlabs"];
+    if (provider === "google") return ["google", "elevenlabs", "puter", "groq"];
+    return ["elevenlabs", "puter", "groq"];
+  };
+
+  const ensurePuterSdk = async (): Promise<void> => {
+    if (window.puter?.ai?.speech2txt) {
+      puterReadyRef.current = true;
+      return;
+    }
+    if (puterScriptPromiseRef.current) {
+      return puterScriptPromiseRef.current;
+    }
+
+    puterScriptPromiseRef.current = new Promise<void>((resolve, reject) => {
+      const existingScript = document.getElementById("puter-sdk-v2") as HTMLScriptElement | null;
+      if (existingScript) {
+        if (window.puter?.ai?.speech2txt) {
+          puterReadyRef.current = true;
+          resolve();
+          return;
+        }
+        existingScript.addEventListener("load", () => {
+          if (window.puter?.ai?.speech2txt) {
+            puterReadyRef.current = true;
+            resolve();
+          } else {
+            reject(new Error("Puter SDK loaded but API is unavailable"))
+          }
+        });
+        existingScript.addEventListener("error", () => {
+          reject(new Error("Failed to load Puter SDK"))
+        });
+        return;
+      }
+
+      const script = document.createElement("script");
+      script.id = "puter-sdk-v2";
+      script.src = "https://js.puter.com/v2/";
+      script.async = true;
+      script.onload = () => {
+        if (window.puter?.ai?.speech2txt) {
+          puterReadyRef.current = true;
+          resolve();
+        } else {
+          reject(new Error("Puter SDK loaded but speech2txt is unavailable"));
+        }
+      };
+      script.onerror = () => {
+        reject(new Error("Failed to load Puter SDK script"));
+      };
+      document.head.appendChild(script);
+    }).catch((error) => {
+      puterScriptPromiseRef.current = null;
+      throw error;
+    });
+
+    return puterScriptPromiseRef.current;
+  };
+
+  const transcribeWithPuter = async (audioBase64: string, mimeType: string): Promise<string> => {
+    await ensurePuterSdk();
+    const speech2txt = window.puter?.ai?.speech2txt;
+    if (!speech2txt) {
+      throw new Error("Puter STT API unavailable");
+    }
+
+    const dataUrl = `data:${mimeType || "audio/webm"};base64,${audioBase64}`;
+    const result = await speech2txt(
+      {
+        file: dataUrl,
+        model: "gpt-4o-mini-transcribe"
+      },
+      {
+        model: "gpt-4o-mini-transcribe"
+      }
+    );
+
+    if (typeof result === "string") {
+      return result.trim();
+    }
+
+    const payload = (result || {}) as {
+      text?: unknown;
+      transcript?: unknown;
+    };
+    const text =
+      (typeof payload.text === "string" ? payload.text : "") ||
+      (typeof payload.transcript === "string" ? payload.transcript : "");
+    return text.trim();
   };
 
   const getCurrentResources = (): UserResources => {
@@ -1515,7 +1651,7 @@ Return STRICT JSON only (no markdown):
       timestamp,
       text: transcript.text,
       source: transcript.source,
-      provider: sttStatus?.provider || sttProvider || "unknown",
+      provider: sttStatus?.provider || resolvedSttProvider || "unknown",
       latencyMs:
         sttStatus && Number.isFinite(sttStatus.avgSttLatencyMs)
           ? Math.max(0, Math.round(sttStatus.avgSttLatencyMs))
@@ -1717,6 +1853,23 @@ Return STRICT JSON only (no markdown):
   }, [resourceScopeSelection]);
 
   useEffect(() => {
+    const user = getCurrentUser();
+    if (!user) return;
+    try {
+      localStorage.setItem(`${STT_PROVIDER_KEY_PREFIX}${user.id}`, selectedSttProvider);
+    } catch {
+      // no-op
+    }
+  }, [selectedSttProvider]);
+
+  useEffect(() => {
+    if (resolvedSttProvider !== "puter") return;
+    ensurePuterSdk().catch((error: any) => {
+      addLog("warning", `⚠️ Puter SDK not ready: ${error?.message || "unknown error"}`);
+    });
+  }, [resolvedSttProvider]);
+
+  useEffect(() => {
     if (transcriptScrollRef.current) {
       transcriptScrollRef.current.scrollTop = transcriptScrollRef.current.scrollHeight;
     }
@@ -1730,7 +1883,7 @@ Return STRICT JSON only (no markdown):
   }, [meeting?.isPaused, meeting?.isRecording]);
 
   useEffect(() => {
-    addLog("info", "🎬 Meeting mode started (streaming)");
+    addLog("info", "🎬 Meeting mode started");
 
     const unsubscribeTranscript = window.electronAPI.meeting.onTranscript((payload) => {
       const transcript = toTranscriptPayload(payload);
@@ -1774,6 +1927,25 @@ Return STRICT JSON only (no markdown):
       }));
     });
 
+    const unsubscribePuterRequest = window.electronAPI.meeting.onPuterTranscribeRequest((payload) => {
+      const handleRequest = async () => {
+        if (!payload?.requestId) return;
+        try {
+          const transcript = await transcribeWithPuter(payload.audioBase64, payload.mimeType);
+          await window.electronAPI.meeting.respondPuterTranscribe(payload.requestId, {
+            success: true,
+            transcript
+          });
+        } catch (error: any) {
+          await window.electronAPI.meeting.respondPuterTranscribe(payload.requestId, {
+            success: false,
+            error: error?.message || "Puter transcription failed"
+          });
+        }
+      };
+      handleRequest().catch(() => undefined);
+    });
+
     return () => {
       if (meetingStateRef.current.isRecording) {
         meetingStateRef.current = { isRecording: false, isPaused: false };
@@ -1785,6 +1957,7 @@ Return STRICT JSON only (no markdown):
       unsubscribePartial();
       unsubscribeError();
       unsubscribeSttStatus();
+      unsubscribePuterRequest();
 
       if (durationIntervalRef.current) clearInterval(durationIntervalRef.current);
       if (questionDebounceRef.current) {
@@ -1865,6 +2038,11 @@ Return STRICT JSON only (no markdown):
         addLog("info", `📚 Active folders: ${getSelectedFolderLabels().join(", ")}`);
       }
 
+      if (resolvedSttProvider === "puter") {
+        await ensurePuterSdk();
+        addLog("success", "✅ Puter STT bridge ready");
+      }
+
       const micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -1878,7 +2056,7 @@ Return STRICT JSON only (no markdown):
 
       const activeSources: MeetingAudioSource[] = ["user"];
       if (useChunkedStt) {
-        addLog("info", `🆓 Using chunked STT free tier (${sttProvider}).`);
+        addLog("info", `🆓 Using chunked STT mode (${resolvedSttProvider}).`);
       } else {
         try {
           const displayStream = await navigator.mediaDevices.getDisplayMedia({
@@ -1903,7 +2081,18 @@ Return STRICT JSON only (no markdown):
         }
       }
 
-      const result = await window.electronAPI.meeting.start(meetingTitle.trim(), activeSources);
+      const sttStartOptions =
+        selectedSttProvider === "auto"
+          ? undefined
+          : {
+              sttProvider: selectedSttProvider,
+              sttProviderChain: getConfiguredSttProviderChain(selectedSttProvider)
+            };
+      const result = await window.electronAPI.meeting.start(
+        meetingTitle.trim(),
+        activeSources,
+        sttStartOptions
+      );
       if (!result.success || !result.meetingId) throw new Error(result.error || "Failed");
       meetingStarted = true;
 
@@ -2205,7 +2394,11 @@ Return STRICT JSON only (no markdown):
     }, {});
 
     return (
-      <div className={`liquid-glass p-4 ${compact ? "w-[560px] max-w-[96vw]" : "w-full"}`}>
+      <div
+        className={`mx-auto w-full min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm ${
+          compact ? "max-w-[840px]" : "max-w-[980px]"
+        }`}
+      >
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-bold text-gray-800">🎤 Start Meeting</h2>
           <button onClick={onClose} className="rounded p-1 hover:bg-white/20">
@@ -2311,6 +2504,39 @@ Return STRICT JSON only (no markdown):
 
         <div className="mb-3 rounded-lg border border-white/30 bg-white/20 p-2">
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
+            Speech-To-Text Provider
+          </div>
+          <label className="flex flex-col gap-1 text-[10px]">
+            <span className="text-gray-700">Provider</span>
+            <select
+              value={selectedSttProvider}
+              onChange={(event) =>
+                setSelectedSttProvider(normalizeSttProviderChoice(event.target.value))
+              }
+              className="rounded border border-white/40 bg-white/70 px-2 py-1 text-[10px] text-gray-800"
+            >
+              <option value="auto">Auto ({envDefaultSttProvider})</option>
+              <option value="elevenlabs">ElevenLabs Realtime</option>
+              <option value="puter">Puter (renderer bridge)</option>
+              <option value="groq">Groq Whisper</option>
+              <option value="google">Google Speech</option>
+            </select>
+          </label>
+          <div className="mt-2 text-[9px] text-gray-600">
+            Active provider: <strong>{resolvedSttProvider}</strong>.{" "}
+            {useStreamingStt
+              ? "Realtime streaming mode (supports interviewer audio capture)."
+              : "Chunked mode (runs robust fallback chain through main pipeline)."}
+          </div>
+          {resolvedSttProvider === "puter" && (
+            <div className="mt-1 text-[9px] text-gray-600">
+              Uses Puter JS in renderer while keeping reconnect/backpressure/fallback orchestration in Electron main.
+            </div>
+          )}
+        </div>
+
+        <div className="mb-3 rounded-lg border border-white/30 bg-white/20 p-2">
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
             Performance Controls
           </div>
           <div className="grid grid-cols-2 gap-2 text-[10px]">
@@ -2384,8 +2610,8 @@ Return STRICT JSON only (no markdown):
 
   return (
     <div
-      className={`chat-container flex flex-col p-4 liquid-glass ${
-        compact ? "w-[760px] max-w-[96vw]" : "w-[980px] max-w-[98vw]"
+      className={`chat-container liquid-glass mx-auto flex w-full min-w-0 flex-col p-4 ${
+        compact ? "max-w-[820px]" : "max-w-[960px]"
       }`}
     >
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -2483,7 +2709,7 @@ Return STRICT JSON only (no markdown):
         </div>
       )}
 
-      <div className="mb-3 grid min-h-[340px] flex-1 grid-cols-1 gap-3 md:grid-cols-2">
+      <div className={`mb-3 grid ${compact ? "min-h-[220px]" : "min-h-[300px]"} flex-1 grid-cols-1 gap-3 md:grid-cols-2`}>
         <div
           ref={transcriptScrollRef}
           className="glass-content max-h-[52vh] overflow-y-auto rounded-lg border border-white/20 bg-white/10 p-3 shadow-lg"

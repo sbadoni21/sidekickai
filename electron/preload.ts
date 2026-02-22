@@ -50,6 +50,20 @@ interface MeetingSttStatus {
   avgSttLatencyMs: number;
 }
 
+type MeetingSttProvider = "auto" | "elevenlabs" | "google" | "groq" | "puter"
+
+interface MeetingStartOptions {
+  sttProvider?: MeetingSttProvider
+  sttProviderChain?: string[]
+}
+
+interface PuterTranscribeRequestPayload {
+  requestId: string
+  audioBase64: string
+  mimeType: string
+  source: MeetingAudioSource
+}
+
 interface Meeting {
   id: string;
   title: string;
@@ -155,11 +169,15 @@ interface ElectronAPI {
   
   // Meeting Assistant API
   meeting: {
-    start: (title: string, sources?: MeetingAudioSource[]) => Promise<{ success: boolean; meetingId?: string; provider?: string; error?: string }>;
+    start: (title: string, sources?: MeetingAudioSource[], options?: MeetingStartOptions) => Promise<{ success: boolean; meetingId?: string; provider?: string; error?: string }>;
     pause: () => Promise<{ success: boolean; error?: string }>;
     resume: () => Promise<{ success: boolean; error?: string }>;
     stop: () => Promise<{ success: boolean; meeting?: Meeting; error?: string }>;
     transcribeChunk: (audioBase64: string, mimeType: string) => Promise<{ success: boolean; transcript?: string; error?: string }>;
+    respondPuterTranscribe: (
+      requestId: string,
+      payload: { success: boolean; transcript?: string; error?: string }
+    ) => Promise<{ success: boolean; error?: string }>;
     getCurrent: () => Promise<{ success: boolean; meeting?: Meeting; error?: string }>;
     getSttStatus: () => Promise<{ success: boolean; status?: MeetingSttStatus; error?: string }>;
     updateAnalytics: (payload: Record<string, unknown>) => Promise<{ success: boolean; error?: string }>;
@@ -170,6 +188,7 @@ interface ElectronAPI {
     onPartial: (callback: (payload: string | LiveTranscriptPayload) => void) => () => void;
     onError: (callback: (payload: { source: MeetingAudioSource; message: string }) => void) => () => void;
     onSttStatus: (callback: (payload: MeetingSttStatus & { event?: string; detail?: string }) => void) => () => void;
+    onPuterTranscribeRequest: (callback: (payload: PuterTranscribeRequestPayload) => void) => () => void;
   };
   
   invoke: (channel: string, ...args: any[]) => Promise<any>
@@ -200,6 +219,7 @@ export const MEETING_EVENTS = {
   PARTIAL: "meeting:partial",
   ERROR: "meeting:error",
   STT_STATUS: "meeting:stt-status",
+  PUTER_TRANSCRIBE_REQUEST: "meeting:puter-transcribe-request",
 } as const
 
 export const APP_EVENTS = {
@@ -382,8 +402,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Meeting Assistant API - ALL METHODS IN ONE OBJECT
   meeting: {
     // IPC Invoke methods
-    start: (title: string, sources?: MeetingAudioSource[]) => 
-      ipcRenderer.invoke("meeting:start", title, sources),
+    start: (title: string, sources?: MeetingAudioSource[], options?: MeetingStartOptions) => 
+      ipcRenderer.invoke("meeting:start", title, sources, options),
 
     pause: () => 
       ipcRenderer.invoke("meeting:pause"),
@@ -396,6 +416,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
     transcribeChunk: (audioBase64: string, mimeType: string) => 
       ipcRenderer.invoke("meeting:transcribe-chunk", audioBase64, mimeType),
+
+    respondPuterTranscribe: (
+      requestId: string,
+      payload: { success: boolean; transcript?: string; error?: string }
+    ) =>
+      ipcRenderer.invoke("meeting:puter-transcribe-response", {
+        requestId,
+        ...payload
+      }),
 
     getCurrent: () => 
       ipcRenderer.invoke("meeting:get-current"),
@@ -503,6 +532,23 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.on(MEETING_EVENTS.STT_STATUS, subscription)
       return () => {
         ipcRenderer.removeListener(MEETING_EVENTS.STT_STATUS, subscription)
+      }
+    },
+
+    onPuterTranscribeRequest: (
+      callback: (payload: PuterTranscribeRequestPayload) => void
+    ) => {
+      const subscription = (_: any, payload: Partial<PuterTranscribeRequestPayload>) => {
+        callback({
+          requestId: String(payload?.requestId || ""),
+          audioBase64: String(payload?.audioBase64 || ""),
+          mimeType: String(payload?.mimeType || "audio/webm"),
+          source: payload?.source === "interviewer" ? "interviewer" : "user"
+        })
+      }
+      ipcRenderer.on(MEETING_EVENTS.PUTER_TRANSCRIBE_REQUEST, subscription)
+      return () => {
+        ipcRenderer.removeListener(MEETING_EVENTS.PUTER_TRANSCRIBE_REQUEST, subscription)
       }
     }
   },

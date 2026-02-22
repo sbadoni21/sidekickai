@@ -37,6 +37,20 @@ interface MeetingSttStatus {
   avgSttLatencyMs: number
 }
 
+type MeetingSttProvider = "auto" | "elevenlabs" | "google" | "groq" | "puter"
+
+interface MeetingStartOptions {
+  sttProvider?: MeetingSttProvider
+  sttProviderChain?: string[]
+}
+
+interface PuterTranscribeRequestPayload {
+  requestId: string
+  audioBase64: string
+  mimeType: string
+  source: MeetingAudioSource
+}
+
 interface Meeting {
   id: string
   title: string
@@ -124,11 +138,19 @@ export interface ElectronAPI {
     sendPCM: (buffer: ArrayBuffer, source?: MeetingAudioSource) => void
   }
   meeting: {
-    start: (title: string, sources?: MeetingAudioSource[]) => Promise<{ success: boolean; meetingId?: string; provider?: string; error?: string }>
+    start: (
+      title: string,
+      sources?: MeetingAudioSource[],
+      options?: MeetingStartOptions
+    ) => Promise<{ success: boolean; meetingId?: string; provider?: string; error?: string }>
     pause: () => Promise<{ success: boolean; error?: string }>
     resume: () => Promise<{ success: boolean; error?: string }>
     stop: () => Promise<{ success: boolean; meeting?: Meeting; error?: string }>
     transcribeChunk: (audioBase64: string, mimeType: string) => Promise<{ success: boolean; transcript?: string; error?: string }>
+    respondPuterTranscribe: (
+      requestId: string,
+      payload: { success: boolean; transcript?: string; error?: string }
+    ) => Promise<{ success: boolean; error?: string }>
     getCurrent: () => Promise<{ success: boolean; meeting?: Meeting; error?: string }>
     getSttStatus: () => Promise<{ success: boolean; status?: MeetingSttStatus; error?: string }>
     updateAnalytics: (payload: Record<string, unknown>) => Promise<{ success: boolean; error?: string }>
@@ -139,6 +161,9 @@ export interface ElectronAPI {
     onPartial: (callback: (payload: string | LiveTranscriptPayload) => void) => () => void
     onError: (callback: (payload: { source: MeetingAudioSource; message: string }) => void) => () => void
     onSttStatus: (callback: (payload: MeetingSttStatus & { event?: string; detail?: string }) => void) => () => void
+    onPuterTranscribeRequest: (
+      callback: (payload: PuterTranscribeRequestPayload) => void
+    ) => () => void
   }
   quitApp: () => Promise<void>
   invoke: (channel: string, ...args: any[]) => Promise<any>

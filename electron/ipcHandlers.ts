@@ -12,6 +12,7 @@ import {
   saveRuntimeSecrets
 } from "./runtimeSecrets"
 import {
+  isSttProvider,
   transcribeAudioBase64,
   resolveSttProvider,
   resolveSttProviderChain,
@@ -749,6 +750,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     500,
     60000
   )
+  const PUTER_REQUEST_TIMEOUT_MS = readPositiveInt(
+    process.env.STT_PUTER_REQUEST_TIMEOUT_MS,
+    22_000,
+    2_000,
+    120_000
+  )
 
   let activeStreamingProvider: StreamingProvider | null = null
   let activeChunkProvider: ChunkProvider | null = null
@@ -781,6 +788,14 @@ export function initializeIpcHandlers(appState: AppState): void {
   let sttLatencySamples: number[] = []
   let lastFinalSignature = ""
   let lastFinalAt = 0
+  const pendingPuterRequests = new Map<
+    string,
+    {
+      resolve: (transcript: string) => void
+      reject: (error: Error) => void
+      timeout: NodeJS.Timeout
+    }
+  >()
 
   const chunkMaxBytes = Math.floor(
     (PCM_SAMPLE_RATE_HZ * PCM_BYTES_PER_SAMPLE * CHUNK_FALLBACK_MAX_BUFFER_MS) / 1000
@@ -828,6 +843,81 @@ export function initializeIpcHandlers(appState: AppState): void {
       droppedAudioChunks,
       avgSttLatencyMs: getAverageSttLatency()
     })
+  }
+
+  const clearPendingPuterRequests = (reason: string) => {
+    if (pendingPuterRequests.size === 0) return
+    pendingPuterRequests.forEach(entry => {
+      clearTimeout(entry.timeout)
+      entry.reject(new Error(reason))
+    })
+    pendingPuterRequests.clear()
+  }
+
+  const requestPuterTranscription = (
+    audioBase64: string,
+    mimeType: string,
+    source: MeetingAudioSource
+  ): Promise<string> => {
+    const mainWindow = getMainWindow()
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      throw new Error("Renderer bridge unavailable for Puter STT")
+    }
+
+    const requestId = `puter-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`
+    return new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pendingPuterRequests.delete(requestId)
+        reject(new Error("Puter STT timeout"))
+      }, PUTER_REQUEST_TIMEOUT_MS)
+
+      pendingPuterRequests.set(requestId, { resolve, reject, timeout })
+      emitRenderer("meeting:puter-transcribe-request", {
+        requestId,
+        audioBase64,
+        mimeType,
+        source
+      })
+    })
+  }
+
+  const transcribeSingleProvider = async (
+    provider: SttProvider,
+    audioBase64: string,
+    mimeType: string,
+    source: MeetingAudioSource
+  ): Promise<string> => {
+    if (provider === "puter") {
+      return requestPuterTranscription(audioBase64, mimeType, source)
+    }
+    return transcribeAudioBase64(audioBase64, mimeType, {
+      provider,
+      allowFallback: false
+    })
+  }
+
+  const transcribeWithProviderChain = async (
+    audioBase64: string,
+    mimeType: string,
+    providers: SttProvider[],
+    source: MeetingAudioSource
+  ): Promise<{ transcript: string; provider: SttProvider }> => {
+    const candidates = providers.length > 0 ? providers : [resolveSttProvider()]
+    const attemptedErrors: string[] = []
+
+    for (const provider of candidates) {
+      try {
+        const transcript = await transcribeSingleProvider(provider, audioBase64, mimeType, source)
+        return { transcript, provider }
+      } catch (error: any) {
+        const message = error?.message || String(error)
+        attemptedErrors.push(`${provider}: ${message}`)
+      }
+    }
+
+    throw new Error(
+      `STT provider chain failed (${candidates.join(" -> ")}): ${attemptedErrors.join(" | ")}`
+    )
   }
 
   const clearPcmQueues = () => {
@@ -881,6 +971,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     chunkTranscriptionInFlight = false
     clearPcmQueues()
     clearChunkBuffers()
+    clearPendingPuterRequests("Meeting stopped")
     lastFinalSignature = ""
     lastFinalAt = 0
   }
@@ -1134,11 +1225,24 @@ export function initializeIpcHandlers(appState: AppState): void {
 
         const wavBase64 = buildWavBufferFromPcm(pcm).toString("base64")
         const startedAt = Date.now()
-        const transcript = await transcribeAudioBase64(wavBase64, "audio/wav", {
-          provider: activeChunkProvider,
-          providerChain: providerChain.slice(providerChainIndex),
-          allowFallback: true
-        })
+        const { transcript, provider: usedProvider } = await transcribeWithProviderChain(
+          wavBase64,
+          "audio/wav",
+          providerChain.slice(providerChainIndex),
+          source
+        )
+        if (usedProvider !== activeChunkProvider) {
+          const previousIndex = providerChainIndex
+          const nextIndex = providerChain.indexOf(usedProvider)
+          activeChunkProvider = usedProvider
+          if (nextIndex >= 0 && nextIndex !== previousIndex) {
+            providerChainIndex = nextIndex
+            if (nextIndex > previousIndex) {
+              fallbackCount += nextIndex - previousIndex
+            }
+            emitSttStatus("provider-fallback", `chunked-${usedProvider}`)
+          }
+        }
         pushSttLatencySample(Date.now() - startedAt)
 
         if (transcript.trim()) {
@@ -1428,13 +1532,83 @@ export function initializeIpcHandlers(appState: AppState): void {
     enqueuePcm(source, buffer)
   })
 
+  ipcMain.handle(
+    "meeting:puter-transcribe-response",
+    async (
+      _event,
+      payload?: {
+        requestId?: string
+        success?: boolean
+        transcript?: string
+        error?: string
+      }
+    ) => {
+      const requestId = String(payload?.requestId || "").trim()
+      if (!requestId) {
+        return { success: false, error: "Missing requestId" }
+      }
+      const pending = pendingPuterRequests.get(requestId)
+      if (!pending) {
+        return { success: false, error: "Unknown or expired requestId" }
+      }
+
+      pendingPuterRequests.delete(requestId)
+      clearTimeout(pending.timeout)
+
+      if (payload?.success) {
+        const transcript = String(payload.transcript || "")
+        pending.resolve(transcript)
+        return { success: true }
+      }
+
+      pending.reject(new Error(String(payload?.error || "Puter transcription failed")))
+      return { success: true }
+    }
+  )
+
 
   // Meeting Handlers
-  ipcMain.handle("meeting:start", async (event, title: string, sources?: MeetingAudioSource[]) => {
+  ipcMain.handle(
+    "meeting:start",
+    async (
+      event,
+      title: string,
+      sources?: MeetingAudioSource[],
+      options?: {
+        sttProvider?: string
+        sttProviderChain?: string[]
+      }
+    ) => {
     try {
       stopAllStt()
 
-      providerChain = resolveSttProviderChain(resolveSttProvider())
+      const configuredProviderRaw = String(options?.sttProvider || "")
+        .trim()
+        .toLowerCase()
+      const preferredProvider = isSttProvider(configuredProviderRaw)
+        ? configuredProviderRaw
+        : resolveSttProvider()
+      const requestedChain = Array.isArray(options?.sttProviderChain)
+        ? Array.from(
+            new Set(
+              options.sttProviderChain
+                .map(provider => String(provider || "").trim().toLowerCase())
+                .filter(isSttProvider)
+            )
+          )
+        : []
+      if (requestedChain.length > 0) {
+        const chain = requestedChain.includes(preferredProvider)
+          ? [...requestedChain]
+          : [preferredProvider, ...requestedChain]
+        const defaults = resolveSttProviderChain(preferredProvider)
+        defaults.forEach(provider => {
+          if (!chain.includes(provider)) chain.push(provider)
+        })
+        providerChain = chain
+      } else {
+        providerChain = resolveSttProviderChain(preferredProvider)
+      }
       providerChainIndex = 0
       reconnectAttempts = 0
       reconnectCount = 0
@@ -1486,7 +1660,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       console.error("Error starting meeting:", error)
       return { success: false, error: error.message }
     }
-  })
+    }
+  )
 
   ipcMain.handle("meeting:pause", async () => {
     try {
@@ -1569,10 +1744,23 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
 
       const startedAt = Date.now()
-      const transcript = await transcribeAudioBase64(audioBase64, mimeType, {
-        providerChain: sttProviders,
-        allowFallback: true
-      })
+      const { transcript, provider: usedProvider } = await transcribeWithProviderChain(
+        audioBase64,
+        mimeType,
+        sttProviders,
+        "user"
+      )
+      const previousIndex = providerChainIndex
+      const nextIndex = providerChain.indexOf(usedProvider)
+      if (nextIndex >= 0 && nextIndex !== previousIndex) {
+        providerChainIndex = nextIndex
+        if (nextIndex > previousIndex) {
+          fallbackCount += nextIndex - previousIndex
+        }
+        activeStreamingProvider = null
+        activeChunkProvider = usedProvider
+        emitSttStatus("provider-fallback", `chunked-${usedProvider}`)
+      }
       pushSttLatencySample(Date.now() - startedAt)
 
       if (transcript && transcript.trim()) {

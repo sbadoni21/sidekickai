@@ -62,8 +62,8 @@ const Dashboard: React.FC<DashboardProps> = ({
   }, [loadDashboard, refreshKey])
 
   return (
-    <div className="min-h-[420px] w-full flex items-center justify-center p-2">
-      <div className="w-[920px] rounded-2xl border border-slate-200 bg-white/95 shadow-[0_18px_50px_rgba(15,23,42,0.35)] p-6">
+    <div className="h-full w-full p-0">
+      <div className="h-full w-full bg-white p-4 sm:p-6">
         <div className="auth-drag-handle mb-4 rounded-xl border border-slate-300/80 bg-slate-100/80 py-1">
           <span className="pointer-events-none select-none text-[9px] font-semibold uppercase tracking-[0.18em] text-slate-500">
             Hold and drag to move

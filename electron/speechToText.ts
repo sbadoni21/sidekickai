@@ -3,16 +3,16 @@ import path from "path"
 import axios from "axios"
 import FormData from "form-data"
 
-export type SttProvider = "groq" | "google" | "elevenlabs"
+export type SttProvider = "groq" | "google" | "elevenlabs" | "puter"
 
 const DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 const DEFAULT_GROQ_STT_MODEL = "whisper-large-v3-turbo"
 const DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 const DEFAULT_ELEVENLABS_STT_MODEL = "scribe_v1"
-const DEFAULT_PROVIDER_CHAIN: SttProvider[] = ["elevenlabs", "groq"]
+const DEFAULT_PROVIDER_CHAIN: SttProvider[] = ["elevenlabs", "puter", "groq"]
 
-const isSttProvider = (value: string): value is SttProvider => {
-  return value === "groq" || value === "google" || value === "elevenlabs"
+export const isSttProvider = (value: string): value is SttProvider => {
+  return value === "groq" || value === "google" || value === "elevenlabs" || value === "puter"
 }
 
 const isTruthy = (value?: string): boolean => {
@@ -35,7 +35,7 @@ const appendFallbackProviders = (providers: SttProvider[]): SttProvider[] => {
   const includeGoogle =
     providers.includes("google") || shouldAllowGoogleFallback()
   const fallbackProviders: SttProvider[] = includeGoogle
-    ? ["elevenlabs", "google", "groq"]
+    ? ["elevenlabs", "google", "puter", "groq"]
     : DEFAULT_PROVIDER_CHAIN
 
   const next = [...providers]
@@ -56,6 +56,7 @@ export const resolveSttProvider = (): SttProvider => {
 
   if (configured === "google") return "google"
   if (configured === "groq") return "groq"
+  if (configured === "puter") return "puter"
   return "elevenlabs"
 }
 
@@ -217,6 +218,9 @@ const transcribeWithProvider = async (
   }
   if (provider === "elevenlabs") {
     return transcribeWithElevenLabs(base64, mimeType)
+  }
+  if (provider === "puter") {
+    throw new Error("Puter STT requires renderer bridge and cannot run in Electron main directly")
   }
   return transcribeWithGroq(base64, mimeType)
 }
