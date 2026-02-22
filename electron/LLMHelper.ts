@@ -407,18 +407,8 @@ Give a concise assistant response and suggest useful next actions in plain text.
   }
 
   public async getOllamaModels(): Promise<string[]> {
-    if (!this.useOllama) return []
-
-    try {
-      const response = await fetch(`${this.ollamaUrl}/api/tags`)
-      if (!response.ok) throw new Error("Failed to fetch models")
-
-      const data = await response.json()
-      return data.models?.map((model: any) => model.name) || []
-    } catch (error) {
-      console.error("[LLMHelper] Error fetching Ollama models:", error)
-      return []
-    }
+    // API-only mode: local model listing is intentionally disabled.
+    return []
   }
 
   public getCurrentProvider(): "ollama" | "groq" {
@@ -430,16 +420,7 @@ Give a concise assistant response and suggest useful next actions in plain text.
   }
 
   public async switchToOllama(model?: string, url?: string): Promise<void> {
-    this.useOllama = true
-    if (url) this.ollamaUrl = url
-
-    if (model) {
-      this.ollamaModel = model
-    } else {
-      await this.initializeOllamaModel()
-    }
-
-    console.log(`[LLMHelper] Switched to Ollama: ${this.ollamaModel} at ${this.ollamaUrl}`)
+    throw new Error("Local model mode is disabled. Use cloud API provider.")
   }
 
   public async switchToGroq(

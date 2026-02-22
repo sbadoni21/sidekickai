@@ -18,42 +18,38 @@ export class ProcessingHelper {
 
   constructor(appState: AppState) {
     this.appState = appState
-    
-    // Check if user wants to use Ollama
-    const useOllama = process.env.USE_OLLAMA === "true"
+
+    // API-only mode: local model execution is disabled.
+    const requestedOllama = process.env.USE_OLLAMA === "true"
     const ollamaModel = process.env.OLLAMA_MODEL // Don't set default here, let LLMHelper auto-detect
     const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434"
     const groqModel = process.env.GROQ_MODEL
     const groqVisionModel = process.env.GROQ_VISION_MODEL
     const groqBaseUrl = process.env.GROQ_BASE_URL
-    
-    if (useOllama) {
-      console.log("[ProcessingHelper] Initializing with Ollama")
-      this.llmHelper = new LLMHelper(
-        undefined,
-        true,
-        ollamaModel,
-        ollamaUrl,
-        groqModel,
-        groqVisionModel,
-        groqBaseUrl
-      )
-    } else {
-      const apiKey = process.env.GROQ_API_KEY
-      if (!apiKey) {
-        throw new Error("GROQ_API_KEY not found in environment variables. Set GROQ_API_KEY or enable Ollama with USE_OLLAMA=true")
-      }
-      console.log("[ProcessingHelper] Initializing with Groq")
-      this.llmHelper = new LLMHelper(
-        apiKey,
-        false,
-        ollamaModel,
-        ollamaUrl,
-        groqModel,
-        groqVisionModel,
-        groqBaseUrl
+
+    if (requestedOllama) {
+      console.warn(
+        "[ProcessingHelper] USE_OLLAMA=true is ignored because API-only mode is enabled."
       )
     }
+
+    const apiKey = process.env.GROQ_API_KEY
+    if (!apiKey) {
+      throw new Error(
+        "GROQ_API_KEY not found in environment variables. API-only mode requires a cloud key."
+      )
+    }
+
+    console.log("[ProcessingHelper] Initializing in API-only mode (Groq)")
+    this.llmHelper = new LLMHelper(
+      apiKey,
+      false,
+      ollamaModel,
+      ollamaUrl,
+      groqModel,
+      groqVisionModel,
+      groqBaseUrl
+    )
   }
 
   public async processScreenshots(): Promise<void> {

@@ -18,7 +18,7 @@ import Resources from "./Resources"
 import { RuntimeMeeting } from "../lib/meetingsStore"
 
 interface QueueProps {
-  setView: React.Dispatch<React.SetStateAction<"dashboard" | "queue" | "solutions" | "debug">>
+  setView: React.Dispatch<React.SetStateAction<"dashboard" | "queue" | "solutions" | "workspace" | "debug">>
   mode?: "full" | "meeting"
   onExitToDashboard?: () => void
   onMeetingSaved?: (meeting: RuntimeMeeting) => Promise<void> | void
@@ -64,6 +64,7 @@ const Queue: React.FC<QueueProps> = ({
   const [contextMessage, setContextMessage] = useState<string>("")
   const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null)
   const [isMeetingOpen, setIsMeetingOpen] = useState(isMeetingOnlyMode)
+  const [meetingEndRequestToken, setMeetingEndRequestToken] = useState(0)
   const [isResourcesOpen, setIsResourcesOpen] = useState(false)
   const [isIncognitoMode, setIsIncognitoMode] = useState(false)
   const [lockWindowResize, setLockWindowResize] = useState(false)
@@ -187,8 +188,11 @@ const Queue: React.FC<QueueProps> = ({
   }
 
   const handleEndMeeting = () => {
-    setIsMeetingOpen(false)
-    onExitToDashboard?.()
+    if (!isMeetingOpen) {
+      onExitToDashboard?.()
+      return
+    }
+    setMeetingEndRequestToken(prev => prev + 1)
   }
 
   const handleMeetingToggle = () => {
@@ -600,11 +604,11 @@ const resizeObserver = new ResizeObserver(() => {
 
   const handleModelChange = (provider: "ollama" | "groq", model: string) => {
     setCurrentModel({ provider, model })
-    const modelName = provider === "ollama" ? model : "Groq"
+    const modelName = model || "Groq"
     
     const systemMessage: ChatMessageType = {
       role: "system",
-      text: `🔄 ${provider === "ollama" ? "🏠" : "☁️"} ${modelName} active`,
+      text: `🔄 ☁️ ${modelName} active`,
       timestamp: Date.now(),
       id: Date.now().toString()
     };
@@ -776,7 +780,7 @@ const resizeObserver = new ResizeObserver(() => {
               >
                 {chatMessages.length === 0 ? (
                   <div className="text-sm text-gray-600 text-center mt-8">
-                    💬 Multi-Mode Coach - {currentModel.provider === "ollama" ? "🏠" : "☁️"} {currentModel.model}
+                    💬 Multi-Mode Coach - ☁️ {currentModel.model}
                     <br />
                     <span className="text-xs text-gray-500">Choose your learning style above</span>
                     <br />
@@ -850,6 +854,7 @@ const resizeObserver = new ResizeObserver(() => {
       <MeetingMode
         onClose={closeMeetingMode}
         onMeetingSaved={onMeetingSaved}
+        endRequestToken={meetingEndRequestToken}
         compact={true}
       />
     </div>
@@ -858,6 +863,7 @@ const resizeObserver = new ResizeObserver(() => {
       <MeetingMode
         onClose={closeMeetingMode}
         onMeetingSaved={onMeetingSaved}
+        endRequestToken={meetingEndRequestToken}
         compact={false}
       />
     </div>

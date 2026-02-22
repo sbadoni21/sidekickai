@@ -6,6 +6,7 @@ import { WindowHelper } from "./WindowHelper"
 import { ScreenshotHelper } from "./ScreenshotHelper"
 import { ShortcutsHelper } from "./shortcuts"
 import { ProcessingHelper } from "./ProcessingHelper"
+import { applyRuntimeSecretsToEnv } from "./runtimeSecrets"
 
 // Meeting-related interfaces
 interface MeetingNote {
@@ -312,6 +313,10 @@ export class AppState {
     this.windowHelper.setWindowDimensions(width, height)
   }
 
+  public resizeWindowBy(deltaWidth: number, deltaHeight: number): void {
+    this.windowHelper.resizeWindowBy(deltaWidth, deltaHeight)
+  }
+
   public clearQueues(): void {
     this.screenshotHelper.clearQueues()
 
@@ -526,14 +531,17 @@ export type {
 
 // Application initialization
 async function initializeApp() {
+  applyRuntimeSecretsToEnv()
   const appState = AppState.getInstance()
 
   // Initialize IPC handlers before window creation
   initializeIpcHandlers(appState)
 
-  // Enable Chromium logging for more verbose network/debug info
-  app.commandLine.appendSwitch("enable-logging")
-  app.commandLine.appendSwitch("v", "1")
+  // Keep Chromium verbose logging opt-in to avoid noisy terminal output in normal runs.
+  if (process.env.ELECTRON_VERBOSE_LOGGING === "1") {
+    app.commandLine.appendSwitch("enable-logging")
+    app.commandLine.appendSwitch("v", "1")
+  }
 
   app.whenReady().then(() => {
     console.log("App is ready")

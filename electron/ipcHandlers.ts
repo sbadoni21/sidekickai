@@ -1,7 +1,16 @@
 // ipcHandlers.ts
 
-import { ipcMain, app } from "electron"
+import { ipcMain, app, BrowserWindow } from "electron"
+import axios from "axios"
+import path from "node:path"
+import fs from "node:fs/promises"
+import { execFile } from "node:child_process"
 import { AppState } from "./main"
+import {
+  applyRuntimeSecretsToEnv,
+  getRuntimeSecretsStatus,
+  saveRuntimeSecrets
+} from "./runtimeSecrets"
 import {
   transcribeAudioBase64,
   resolveSttProvider,
@@ -97,6 +106,589 @@ const buildWavBufferFromPcm = (pcm: Buffer): Buffer => {
   header.writeUInt32LE(pcm.length, 40)
 
   return Buffer.concat([header, pcm])
+}
+
+const MAX_WORKSPACE_FETCH_TEXT_CHARS = 60_000
+const WORKSPACE_FETCH_TIMEOUT_MS = 20_000
+const WORKSPACE_READER_FETCH_TIMEOUT_MS = 25_000
+const WORKSPACE_BROWSER_RENDER_TIMEOUT_MS = 30_000
+const WORKSPACE_BROWSER_RENDER_SETTLE_MS = 1_200
+const WORKSPACE_MIN_MEANINGFUL_CHARS = 140
+const WORKSPACE_MIN_MEANINGFUL_WORDS = 24
+const WORKSPACE_MIN_ACCEPTABLE_CHARS = 40
+const WORKSPACE_MIN_ACCEPTABLE_WORDS = 6
+const WORKSPACE_READER_PROXY_DISABLED = process.env.WORKSPACE_READER_PROXY_DISABLED === "1"
+const WORKSPACE_BROWSER_FALLBACK_DISABLED = process.env.WORKSPACE_BROWSER_FALLBACK_DISABLED === "1"
+
+const decodeHtmlEntities = (input: string): string =>
+  input
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#(\d+);/g, (_match, code) => {
+      const numeric = Number(code)
+      if (!Number.isFinite(numeric)) return _match
+      return String.fromCharCode(numeric)
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex) => {
+      const numeric = Number.parseInt(hex, 16)
+      if (!Number.isFinite(numeric)) return _match
+      return String.fromCharCode(numeric)
+    })
+
+const collapseWhitespace = (input: string): string =>
+  input
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim()
+
+const htmlToReadableText = (html: string): string => {
+  const withoutScripts = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+
+  const withSoftBreaks = withoutScripts
+    .replace(/<\/(p|div|section|article|h1|h2|h3|h4|h5|h6|li|tr)>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+
+  const noTags = withSoftBreaks.replace(/<[^>]+>/g, " ")
+  return collapseWhitespace(decodeHtmlEntities(noTags))
+}
+
+const stripReaderMetadata = (input: string): string => {
+  const normalized = input.replace(/\r/g, "").trim()
+  const marker = "Markdown Content:"
+  const markerIndex = normalized.indexOf(marker)
+  const body = markerIndex >= 0 ? normalized.slice(markerIndex + marker.length) : normalized
+  return body
+    .replace(/^Title:\s.*\n/gi, "")
+    .replace(/^URL Source:\s.*\n/gi, "")
+    .replace(/^Published Time:\s.*\n/gi, "")
+    .trim()
+}
+
+const extractMetaDescription = (html: string): string => {
+  const patterns = [
+    /<meta[^>]+name=["']description["'][^>]*content=["']([\s\S]*?)["'][^>]*>/i,
+    /<meta[^>]+content=["']([\s\S]*?)["'][^>]*name=["']description["'][^>]*>/i,
+    /<meta[^>]+property=["']og:description["'][^>]*content=["']([\s\S]*?)["'][^>]*>/i,
+    /<meta[^>]+content=["']([\s\S]*?)["'][^>]*property=["']og:description["'][^>]*>/i
+  ]
+  for (const pattern of patterns) {
+    const match = html.match(pattern)
+    if (!match?.[1]) continue
+    const value = collapseWhitespace(decodeHtmlEntities(match[1]))
+    if (value) return value
+  }
+  return ""
+}
+
+const decodeJsonEscapedString = (value: string): string => {
+  if (!value) return ""
+  try {
+    const decoded = JSON.parse(`"${value.replace(/"/g, '\\"')}"`)
+    return collapseWhitespace(decodeHtmlEntities(String(decoded)))
+  } catch {
+    return collapseWhitespace(
+      decodeHtmlEntities(
+        value
+          .replace(/\\n/g, "\n")
+          .replace(/\\r/g, "")
+          .replace(/\\t/g, " ")
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, "\\")
+      )
+    )
+  }
+}
+
+const extractTextFromStructuredJson = (html: string): string => {
+  const collected: string[] = []
+
+  const articleBodyMatches = html.matchAll(/"articleBody"\s*:\s*"((?:\\.|[^"\\])+)"/gi)
+  for (const match of articleBodyMatches) {
+    const candidate = decodeJsonEscapedString(match[1] || "")
+    if (candidate) collected.push(candidate)
+  }
+
+  const ldJsonMatches = html.matchAll(
+    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+  )
+  for (const match of ldJsonMatches) {
+    const block = (match[1] || "").trim()
+    if (!block) continue
+    try {
+      const parsed = JSON.parse(block)
+      const queue: any[] = Array.isArray(parsed) ? [...parsed] : [parsed]
+      while (queue.length > 0) {
+        const node = queue.shift()
+        if (!node) continue
+        if (typeof node === "string") {
+          if (node.length > 140) {
+            collected.push(collapseWhitespace(decodeHtmlEntities(node)))
+          }
+          continue
+        }
+        if (Array.isArray(node)) {
+          queue.push(...node)
+          continue
+        }
+        if (typeof node === "object") {
+          const articleBody = typeof node.articleBody === "string" ? node.articleBody : ""
+          if (articleBody) {
+            collected.push(collapseWhitespace(decodeHtmlEntities(articleBody)))
+          }
+          const description = typeof node.description === "string" ? node.description : ""
+          if (description && description.length > 120) {
+            collected.push(collapseWhitespace(decodeHtmlEntities(description)))
+          }
+          Object.values(node).forEach(value => queue.push(value))
+        }
+      }
+    } catch {
+      // Ignore malformed JSON blocks.
+    }
+  }
+
+  if (collected.length === 0) return ""
+  return collected
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)[0]
+}
+
+const countWords = (text: string): number => {
+  if (!text) return 0
+  return text
+    .split(/\s+/)
+    .filter(token => token.length > 0 && /[a-z0-9]/i.test(token))
+    .length
+}
+
+const isMeaningfulText = (text: string): boolean => {
+  const normalized = collapseWhitespace(text)
+  return (
+    normalized.length >= WORKSPACE_MIN_MEANINGFUL_CHARS &&
+    countWords(normalized) >= WORKSPACE_MIN_MEANINGFUL_WORDS
+  )
+}
+
+const isAcceptableText = (text: string): boolean => {
+  const normalized = collapseWhitespace(text)
+  return (
+    normalized.length >= WORKSPACE_MIN_ACCEPTABLE_CHARS &&
+    countWords(normalized) >= WORKSPACE_MIN_ACCEPTABLE_WORDS
+  )
+}
+
+const normalizeFetchedText = (rawText: string): string => {
+  const stripped = stripReaderMetadata(rawText)
+  return collapseWhitespace(decodeHtmlEntities(stripped))
+}
+
+const extractTextFromResponse = (rawBody: string, contentType: string): string => {
+  const normalizedContentType = String(contentType || "").toLowerCase()
+  const lowerBody = rawBody.slice(0, 2048).toLowerCase()
+  const looksLikeHtml =
+    normalizedContentType.includes("text/html") ||
+    normalizedContentType.includes("application/xhtml+xml") ||
+    lowerBody.includes("<html") ||
+    lowerBody.includes("<!doctype html")
+
+  if (!looksLikeHtml) {
+    return normalizeFetchedText(rawBody)
+  }
+
+  const extractedHtmlText = htmlToReadableText(rawBody)
+  if (isMeaningfulText(extractedHtmlText)) {
+    return extractedHtmlText
+  }
+
+  const structuredText = extractTextFromStructuredJson(rawBody)
+  if (isMeaningfulText(structuredText)) {
+    return structuredText
+  }
+
+  const metaDescription = extractMetaDescription(rawBody)
+  if (!metaDescription) {
+    if (structuredText && extractedHtmlText) {
+      return collapseWhitespace(`${structuredText}\n\n${extractedHtmlText}`)
+    }
+    return structuredText || extractedHtmlText
+  }
+  if (!extractedHtmlText) {
+    return structuredText ? collapseWhitespace(`${metaDescription}\n\n${structuredText}`) : metaDescription
+  }
+
+  const combined = structuredText
+    ? `${metaDescription}\n\n${structuredText}\n\n${extractedHtmlText}`
+    : `${metaDescription}\n\n${extractedHtmlText}`
+  return collapseWhitespace(combined)
+}
+
+const titleFromUrl = (urlString: string): string => {
+  try {
+    const parsed = new URL(urlString)
+    const parts = parsed.pathname.split("/").filter(Boolean)
+    const last = parts[parts.length - 1] || parsed.hostname
+    const normalized = decodeURIComponent(last)
+      .replace(/[-_]+/g, " ")
+      .replace(/\.[a-z0-9]+$/i, "")
+      .trim()
+    return normalized || parsed.hostname
+  } catch {
+    return "Imported URL"
+  }
+}
+
+const extractHtmlTitle = (html: string, fallbackUrl: string): string => {
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+  if (!match?.[1]) {
+    return titleFromUrl(fallbackUrl)
+  }
+  const normalized = collapseWhitespace(decodeHtmlEntities(match[1]))
+  return normalized || titleFromUrl(fallbackUrl)
+}
+
+const fetchTextPayload = async (
+  url: string,
+  timeoutMs: number
+): Promise<{ url: string; body: string; contentType: string }> => {
+  const response = await axios.get<string>(url, {
+    timeout: timeoutMs,
+    responseType: "text",
+    maxContentLength: 4 * 1024 * 1024,
+    maxBodyLength: 4 * 1024 * 1024,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; WorkspaceImporter/1.0)",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5"
+    },
+    validateStatus: status => status >= 200 && status < 400
+  })
+
+  const finalUrl = String((response.request as any)?.res?.responseUrl || url)
+  const body =
+    typeof response.data === "string"
+      ? response.data
+      : JSON.stringify(response.data)
+  const contentType = String(response.headers?.["content-type"] || "").toLowerCase()
+
+  return {
+    url: finalUrl,
+    body,
+    contentType
+  }
+}
+
+const buildReaderProxyUrls = (url: string): string[] => {
+  const stripped = url.replace(/^https?:\/\//i, "")
+  const candidates = [
+    `https://r.jina.ai/http://${stripped}`,
+    `https://r.jina.ai/${url}`
+  ]
+  return Array.from(new Set(candidates))
+}
+
+const fetchViaReaderProxy = async (url: string): Promise<string | null> => {
+  if (WORKSPACE_READER_PROXY_DISABLED) return null
+  const candidates = buildReaderProxyUrls(url)
+
+  for (const candidate of candidates) {
+    try {
+      const response = await axios.get<string>(candidate, {
+        timeout: WORKSPACE_READER_FETCH_TIMEOUT_MS,
+        responseType: "text",
+        maxContentLength: 4 * 1024 * 1024,
+        maxBodyLength: 4 * 1024 * 1024,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; WorkspaceImporter/1.0)",
+          Accept: "text/plain,text/markdown,text/html;q=0.9,*/*;q=0.5"
+        },
+        validateStatus: status => status >= 200 && status < 400
+      })
+
+      const raw =
+        typeof response.data === "string"
+          ? response.data
+          : JSON.stringify(response.data)
+      const extracted = normalizeFetchedText(raw)
+      if (isMeaningfulText(extracted) || isAcceptableText(extracted)) {
+        return extracted
+      }
+    } catch {
+      // Try next reader endpoint candidate.
+    }
+  }
+
+  return null
+}
+
+const trimWorkspaceText = (text: string): { content: string; truncated: boolean } => {
+  const normalized = collapseWhitespace(text)
+  if (normalized.length <= MAX_WORKSPACE_FETCH_TEXT_CHARS) {
+    return { content: normalized, truncated: false }
+  }
+  return {
+    content: normalized.slice(0, MAX_WORKSPACE_FETCH_TEXT_CHARS),
+    truncated: true
+  }
+}
+
+const WORKSPACE_TEXT_EXTENSIONS = new Set([".txt", ".md", ".csv", ".json"])
+const WORKSPACE_IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".bmp",
+  ".tif",
+  ".tiff",
+  ".heic",
+  ".heif"
+])
+const WORKSPACE_ENHANCED_EXTENSIONS = new Set([".docx", ".pdf", ...WORKSPACE_IMAGE_EXTENSIONS])
+const WORKSPACE_SUPPORTED_EXTENSIONS = new Set([
+  ...WORKSPACE_TEXT_EXTENSIONS,
+  ...WORKSPACE_ENHANCED_EXTENSIONS
+])
+
+const readDocxTextWithTextUtil = async (filePath: string): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "textutil",
+      ["-convert", "txt", "-stdout", filePath],
+      {
+        maxBuffer: 12 * 1024 * 1024
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              stderr?.trim() || error.message || "textutil failed while extracting DOCX."
+            )
+          )
+          return
+        }
+        resolve(String(stdout || ""))
+      }
+    )
+  })
+}
+
+const normalizeDocxXmlText = (xml: string): string => {
+  const withBreaks = xml
+    .replace(/<w:p\b[^>]*>/gi, "\n")
+    .replace(/<\/w:p>/gi, "\n")
+    .replace(/<w:tr\b[^>]*>/gi, "\n")
+    .replace(/<\/w:tr>/gi, "\n")
+    .replace(/<w:br\b[^>]*\/>/gi, "\n")
+    .replace(/<w:cr\b[^>]*\/>/gi, "\n")
+    .replace(/<w:tab\b[^>]*\/>/gi, "\t")
+
+  const withoutTags = withBreaks.replace(/<[^>]+>/g, " ")
+  return collapseWhitespace(decodeHtmlEntities(withoutTags))
+}
+
+const readDocxTextWithUnzip = async (filePath: string): Promise<string> => {
+  const documentXml = await new Promise<string>((resolve, reject) => {
+    execFile(
+      "unzip",
+      ["-p", filePath, "word/document.xml"],
+      {
+        maxBuffer: 16 * 1024 * 1024
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              stderr?.trim() || error.message || "unzip failed while reading DOCX document.xml."
+            )
+          )
+          return
+        }
+        resolve(String(stdout || ""))
+      }
+    )
+  })
+
+  return normalizeDocxXmlText(documentXml)
+}
+
+const readDocxText = async (filePath: string): Promise<string> => {
+  const errors: string[] = []
+
+  try {
+    const viaTextUtil = await readDocxTextWithTextUtil(filePath)
+    if (collapseWhitespace(viaTextUtil)) return viaTextUtil
+    errors.push("textutil returned empty content")
+  } catch (error: any) {
+    errors.push(error?.message || "textutil failed")
+  }
+
+  try {
+    const viaUnzip = await readDocxTextWithUnzip(filePath)
+    if (collapseWhitespace(viaUnzip)) return viaUnzip
+    errors.push("unzip fallback returned empty content")
+  } catch (error: any) {
+    errors.push(error?.message || "unzip fallback failed")
+  }
+
+  throw new Error(`Failed to read DOCX. ${errors.join(" | ")}`)
+}
+
+const readPdfTextWithPdftotext = async (filePath: string): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "pdftotext",
+      ["-layout", "-q", filePath, "-"],
+      {
+        maxBuffer: 16 * 1024 * 1024
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        resolve(String(stdout || ""))
+      }
+    )
+  })
+}
+
+const readPdfTextWithMdls = async (filePath: string): Promise<string> => {
+  if (process.platform !== "darwin") {
+    throw new Error("PDF text extraction is not available on this OS.")
+  }
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      "mdls",
+      ["-name", "kMDItemTextContent", "-raw", filePath],
+      {
+        maxBuffer: 16 * 1024 * 1024
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(
+            new Error(
+              stderr?.trim() || error.message || "mdls failed while extracting PDF text."
+            )
+          )
+          return
+        }
+        const raw = String(stdout || "").trim()
+        if (!raw || raw === "(null)") {
+          resolve("")
+          return
+        }
+        resolve(raw)
+      }
+    )
+  })
+}
+
+const readPdfText = async (filePath: string): Promise<string> => {
+  try {
+    const viaPdftotext = await readPdfTextWithPdftotext(filePath)
+    if (collapseWhitespace(viaPdftotext)) return viaPdftotext
+  } catch {
+    // Fall through to mdls.
+  }
+
+  try {
+    const viaMdls = await readPdfTextWithMdls(filePath)
+    if (collapseWhitespace(viaMdls)) return viaMdls
+  } catch {
+    // Fall through to empty.
+  }
+
+  return ""
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise(resolve => {
+    setTimeout(resolve, ms)
+  })
+
+const fetchViaBrowserRender = async (
+  url: string
+): Promise<{ url: string; title: string; content: string } | null> => {
+  if (WORKSPACE_BROWSER_FALLBACK_DISABLED) return null
+
+  let window: BrowserWindow | null = null
+  try {
+    window = new BrowserWindow({
+      show: false,
+      width: 1200,
+      height: 900,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true
+      }
+    })
+
+    const loaded = await Promise.race([
+      window
+        .loadURL(url, {
+          userAgent: "Mozilla/5.0 (compatible; WorkspaceImporter/1.0)"
+        })
+        .then(() => true)
+        .catch(() => false),
+      sleep(WORKSPACE_BROWSER_RENDER_TIMEOUT_MS).then(() => false)
+    ])
+
+    if (!loaded || !window || window.isDestroyed()) return null
+    await sleep(WORKSPACE_BROWSER_RENDER_SETTLE_MS)
+
+    const extracted = await Promise.race([
+      window.webContents.executeJavaScript(
+        `(() => {
+          const pickText = () => {
+            const selectors = ["article", "main", "[role='main']", ".content", ".article", ".slds-rich-text-editor__output", "body"];
+            for (const selector of selectors) {
+              const el = document.querySelector(selector);
+              if (!el) continue;
+              const text = String(el.innerText || "").trim();
+              if (text.length > 0) return text;
+            }
+            return String(document.body?.innerText || "").trim();
+          };
+          return {
+            title: String(document.title || "").trim(),
+            url: String(location.href || "").trim(),
+            content: pickText()
+          };
+        })();`,
+        true
+      ),
+      sleep(WORKSPACE_BROWSER_RENDER_TIMEOUT_MS).then((): null => null)
+    ])
+
+    if (!extracted || typeof extracted !== "object") return null
+    const title = collapseWhitespace(String((extracted as any).title || ""))
+    const finalUrl = String((extracted as any).url || url).trim() || url
+    const content = normalizeFetchedText(String((extracted as any).content || ""))
+    if (!content) return null
+
+    return {
+      url: finalUrl,
+      title: title || titleFromUrl(finalUrl),
+      content
+    }
+  } catch {
+    return null
+  } finally {
+    if (window && !window.isDestroyed()) {
+      window.destroy()
+    }
+  }
 }
 
 export function initializeIpcHandlers(appState: AppState): void {
@@ -598,6 +1190,224 @@ export function initializeIpcHandlers(appState: AppState): void {
     return appState.deleteScreenshot(path)
   })
 
+  ipcMain.handle(
+    "workspace:extract-document-text",
+    async (
+      _event,
+      payload: {
+        filePath?: string
+        fileName?: string
+      }
+    ) => {
+      try {
+        const rawPath = String(payload?.filePath || "").trim()
+        const fileName = String(payload?.fileName || "").trim()
+        if (!rawPath) {
+          return { success: false, error: "File path is required." }
+        }
+
+        const extension = path.extname(fileName || rawPath).toLowerCase()
+        if (!WORKSPACE_SUPPORTED_EXTENSIONS.has(extension)) {
+          return {
+            success: false,
+            error: `Unsupported file type "${extension || "unknown"}".`
+          }
+        }
+
+        let content = ""
+        if (extension === ".docx") {
+          content = await readDocxText(rawPath)
+        } else if (extension === ".pdf") {
+          content = await readPdfText(rawPath)
+        } else if (WORKSPACE_IMAGE_EXTENSIONS.has(extension)) {
+          const imageAnalysis = await appState.processingHelper
+            .getLLMHelper()
+            .analyzeImageFile(rawPath)
+          content = String(imageAnalysis?.text || "")
+        } else {
+          content = await fs.readFile(rawPath, "utf8")
+        }
+
+        const normalized = collapseWhitespace(String(content || ""))
+        if (!normalized) {
+          return { success: false, error: "No readable text found in the selected file." }
+        }
+
+        return {
+          success: true,
+          content: normalized
+        }
+      } catch (error: any) {
+        return {
+          success: false,
+          error: error?.message || "Failed to extract text from file."
+        }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    "workspace:extract-document-upload",
+    async (
+      _event,
+      payload: {
+        fileName?: string
+        base64?: string
+      }
+    ) => {
+      try {
+        const fileName = String(payload?.fileName || "").trim()
+        const base64 = String(payload?.base64 || "").trim()
+
+        if (!fileName || !base64) {
+          return { success: false, error: "File name and content are required." }
+        }
+
+        const extension = path.extname(fileName).toLowerCase()
+        if (!WORKSPACE_SUPPORTED_EXTENSIONS.has(extension)) {
+          return {
+            success: false,
+            error: `Unsupported file type "${extension || "unknown"}".`
+          }
+        }
+
+        const fileBuffer = Buffer.from(base64, "base64")
+        let content = ""
+
+        if (extension === ".docx" || extension === ".pdf" || WORKSPACE_IMAGE_EXTENSIONS.has(extension)) {
+          const tempDir = await fs.mkdtemp(path.join(app.getPath("temp"), "workspace-upload-"))
+          const tempFilePath = path.join(tempDir, fileName.replace(/[^\w.\-]+/g, "_"))
+          try {
+            await fs.writeFile(tempFilePath, fileBuffer)
+            if (extension === ".docx") {
+              content = await readDocxText(tempFilePath)
+            } else if (extension === ".pdf") {
+              content = await readPdfText(tempFilePath)
+            } else {
+              const imageAnalysis = await appState.processingHelper
+                .getLLMHelper()
+                .analyzeImageFile(tempFilePath)
+              content = String(imageAnalysis?.text || "")
+            }
+          } finally {
+            await fs.rm(tempDir, { recursive: true, force: true }).catch((): null => null)
+          }
+        } else {
+          content = fileBuffer.toString("utf8")
+        }
+
+        const normalized = collapseWhitespace(String(content || ""))
+        if (!normalized) {
+          return { success: false, error: "No readable text found in the selected file." }
+        }
+
+        return { success: true, content: normalized }
+      } catch (error: any) {
+        return {
+          success: false,
+          error: error?.message || "Failed to extract text from uploaded file."
+        }
+      }
+    }
+  )
+
+  ipcMain.handle("workspace:fetch-url-content", async (_event, rawUrl: string) => {
+    try {
+      const url = String(rawUrl || "").trim()
+      if (!url) {
+        return { success: false, error: "URL is required." }
+      }
+
+      let parsed: URL
+      try {
+        parsed = new URL(url)
+      } catch {
+        return { success: false, error: "Invalid URL." }
+      }
+
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        return { success: false, error: "Only http/https URLs are supported." }
+      }
+
+      const canonicalUrl = parsed.toString()
+      let finalUrl = canonicalUrl
+      let title = titleFromUrl(canonicalUrl)
+      let directText = ""
+      let directError = ""
+
+      try {
+        const direct = await fetchTextPayload(canonicalUrl, WORKSPACE_FETCH_TIMEOUT_MS)
+        finalUrl = direct.url || canonicalUrl
+        title = extractHtmlTitle(direct.body, finalUrl)
+        directText = extractTextFromResponse(direct.body, direct.contentType)
+      } catch (error: any) {
+        directError = error?.message || "Direct fetch failed."
+      }
+
+      if (isMeaningfulText(directText)) {
+        const trimmed = trimWorkspaceText(directText)
+        return {
+          success: true,
+          url: finalUrl,
+          title,
+          content: trimmed.content,
+          truncated: trimmed.truncated,
+          source: "direct"
+        }
+      }
+
+      const proxyText = await fetchViaReaderProxy(finalUrl)
+      if (proxyText && (isMeaningfulText(proxyText) || !isAcceptableText(directText))) {
+        const trimmed = trimWorkspaceText(proxyText)
+        return {
+          success: true,
+          url: finalUrl,
+          title,
+          content: trimmed.content,
+          truncated: trimmed.truncated,
+          source: "reader-proxy"
+        }
+      }
+
+      const browserRendered = await fetchViaBrowserRender(finalUrl)
+      if (browserRendered?.content && (isMeaningfulText(browserRendered.content) || !isAcceptableText(directText))) {
+        const trimmed = trimWorkspaceText(browserRendered.content)
+        return {
+          success: true,
+          url: browserRendered.url || finalUrl,
+          title: browserRendered.title || title,
+          content: trimmed.content,
+          truncated: trimmed.truncated,
+          source: "browser-render"
+        }
+      }
+
+      if (isAcceptableText(directText)) {
+        const trimmed = trimWorkspaceText(directText)
+        return {
+          success: true,
+          url: finalUrl,
+          title,
+          content: trimmed.content,
+          truncated: trimmed.truncated,
+          source: "direct-lite"
+        }
+      }
+
+      return {
+        success: false,
+        error:
+          "Could not extract enough readable text from this URL. " +
+          (directError
+            ? `Direct fetch error: ${directError}`
+            : "The page may be JS-rendered or blocked by remote anti-bot rules.")
+      }
+    } catch (error: any) {
+      const message = error?.message || String(error)
+      return { success: false, error: `Fetch failed: ${message}` }
+    }
+  })
+
   ipcMain.on("audio:pcm", (_, payload: AudioPCMEventPayload | ArrayBuffer | Buffer | Uint8Array) => {
     let source: MeetingAudioSource = "user"
     let rawBuffer: unknown = payload
@@ -978,6 +1788,18 @@ export function initializeIpcHandlers(appState: AppState): void {
     appState.moveWindowDown()
   })
 
+  ipcMain.handle(
+    "resize-window-by",
+    async (
+      _event,
+      payload: { deltaWidth?: number; deltaHeight?: number } = {}
+    ) => {
+      const deltaWidth = Number(payload.deltaWidth ?? 0)
+      const deltaHeight = Number(payload.deltaHeight ?? 0)
+      appState.resizeWindowBy(deltaWidth, deltaHeight)
+    }
+  )
+
   ipcMain.handle("center-and-show-window", async () => {
     appState.centerAndShowWindow()
   })
@@ -998,37 +1820,68 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   ipcMain.handle("get-available-ollama-models", async () => {
-    try {
-      const llmHelper = appState.processingHelper.getLLMHelper();
-      const models = await llmHelper.getOllamaModels();
-      return models;
-    } catch (error: any) {
-      console.error("Error getting Ollama models:", error);
-      throw error;
-    }
+    return [];
   });
 
   ipcMain.handle("switch-to-ollama", async (_, model?: string, url?: string) => {
-    try {
-      const llmHelper = appState.processingHelper.getLLMHelper();
-      await llmHelper.switchToOllama(model, url);
-      return { success: true };
-    } catch (error: any) {
-      console.error("Error switching to Ollama:", error);
-      return { success: false, error: error.message };
-    }
+    return {
+      success: false,
+      error: "Local model mode is disabled. Use cloud API provider."
+    };
   });
 
   ipcMain.handle("switch-to-groq", async (_, apiKey?: string) => {
     try {
+      const normalizedApiKey = String(apiKey || "").trim()
+      if (normalizedApiKey) {
+        saveRuntimeSecrets({ groqApiKey: normalizedApiKey })
+        applyRuntimeSecretsToEnv()
+      }
       const llmHelper = appState.processingHelper.getLLMHelper();
-      await llmHelper.switchToGroq(apiKey);
+      await llmHelper.switchToGroq(normalizedApiKey || undefined);
       return { success: true };
     } catch (error: any) {
       console.error("Error switching to Groq:", error);
       return { success: false, error: error.message };
     }
   });
+
+  ipcMain.handle("get-runtime-secrets-status", async () => {
+    return getRuntimeSecretsStatus()
+  })
+
+  ipcMain.handle(
+    "set-runtime-secrets",
+    async (
+      _,
+      payload: { groqApiKey?: string; elevenLabsApiKey?: string } = {}
+    ) => {
+      try {
+        const updates: { groqApiKey?: string; elevenLabsApiKey?: string } = {}
+        if (typeof payload.groqApiKey === "string") {
+          updates.groqApiKey = payload.groqApiKey
+        }
+        if (typeof payload.elevenLabsApiKey === "string") {
+          updates.elevenLabsApiKey = payload.elevenLabsApiKey
+        }
+
+        const saved = saveRuntimeSecrets(updates)
+        applyRuntimeSecretsToEnv()
+
+        if (saved.groqApiKey) {
+          const llmHelper = appState.processingHelper.getLLMHelper()
+          await llmHelper.switchToGroq(saved.groqApiKey)
+        }
+
+        return { success: true, status: getRuntimeSecretsStatus() }
+      } catch (error: any) {
+        return {
+          success: false,
+          error: error?.message || "Failed to save runtime secrets."
+        }
+      }
+    }
+  )
 
   // Backward-compatible alias for older renderer calls.
   ipcMain.handle("switch-to-gemini", async (_, apiKey?: string) => {

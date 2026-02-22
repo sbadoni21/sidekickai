@@ -17,28 +17,20 @@ create table if not exists public.meetings (
   mind_map jsonb,
   notes jsonb not null default '[]'::jsonb,
   transcripts jsonb not null default '[]'::jsonb,
-  transcript_segments jsonb not null default '[]'::jsonb,
-  detected_questions jsonb not null default '[]'::jsonb,
-  answer_analytics jsonb not null default '[]'::jsonb,
-  performance_metrics jsonb not null default '{}'::jsonb,
-  session_memory jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint meetings_user_remote_unique unique (user_id, remote_meeting_id)
 );
 
 alter table public.meetings
-  add column if not exists transcript_segments jsonb not null default '[]'::jsonb,
-  add column if not exists detected_questions jsonb not null default '[]'::jsonb,
-  add column if not exists answer_analytics jsonb not null default '[]'::jsonb,
-  add column if not exists performance_metrics jsonb not null default '{}'::jsonb,
-  add column if not exists session_memory jsonb not null default '{}'::jsonb;
+  drop column if exists transcript_segments,
+  drop column if exists detected_questions,
+  drop column if exists answer_analytics,
+  drop column if exists performance_metrics,
+  drop column if exists session_memory;
 
 create index if not exists meetings_user_started_idx
   on public.meetings (user_id, started_at desc);
-
-create index if not exists meetings_detected_questions_gin_idx
-  on public.meetings using gin (detected_questions jsonb_path_ops);
 
 create or replace function public.set_updated_at()
 returns trigger

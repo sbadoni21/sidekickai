@@ -159,11 +159,11 @@ interface SupabaseMeetingRow {
   mind_map: MindMapNode | null
   notes: MeetingNote[] | null
   transcripts: MeetingTranscript[] | null
-  transcript_segments: TranscriptSegmentAnalytics[] | null
-  detected_questions: DetectedQuestionAnalytics[] | null
-  answer_analytics: AnswerAnalytics[] | null
-  performance_metrics: MeetingPerformanceSnapshot | null
-  session_memory: MeetingPerformanceControls | null
+  transcript_segments?: TranscriptSegmentAnalytics[] | null
+  detected_questions?: DetectedQuestionAnalytics[] | null
+  answer_analytics?: AnswerAnalytics[] | null
+  performance_metrics?: MeetingPerformanceSnapshot | null
+  session_memory?: MeetingPerformanceControls | null
   created_at: string
   updated_at: string
 }
@@ -382,7 +382,10 @@ const shouldDisableSupabaseForError = (payload: string): boolean => {
   return (
     payload.includes('"code":"PGRST205"') ||
     payload.includes("Could not find the table 'public.meetings'") ||
-    payload.includes("relation \"public.meetings\" does not exist")
+    payload.includes("relation \"public.meetings\" does not exist") ||
+    payload.includes('"code":"PGRST204"') ||
+    payload.includes("Could not find the '") ||
+    payload.includes("column")
   )
 }
 
@@ -531,12 +534,7 @@ export const saveMeetingRecord = async (
             summary: meeting.summary || null,
             mind_map: meeting.mindMap || null,
             notes: meeting.notes,
-            transcripts: meeting.transcripts,
-            transcript_segments: localRecord.analytics?.transcriptSegments || [],
-            detected_questions: localRecord.analytics?.detectedQuestions || [],
-            answer_analytics: localRecord.analytics?.answers || [],
-            performance_metrics: localRecord.analytics?.performance || {},
-            session_memory: localRecord.analytics?.controls || {}
+            transcripts: meeting.transcripts
           })
         }
       )

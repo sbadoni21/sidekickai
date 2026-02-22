@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react"
 import {
   createResourceItem,
+  DEFAULT_KNOWLEDGE_FOLDER_ID,
+  DEFAULT_KNOWLEDGE_FOLDER_NAME,
   loadResources,
   ResourceItem,
   saveResources,
@@ -29,7 +31,20 @@ const Resources: React.FC<ResourcesProps> = ({ onClose }) => {
   const currentUser = getCurrentUser()
   const [resources, setResources] = useState<UserResources>(() => {
     if (!currentUser) {
-      return { resume: "", documents: [], knowledge: [] }
+      return {
+        resume: "",
+        documents: [],
+        knowledge: [],
+        knowledgeFolders: [
+          {
+            id: DEFAULT_KNOWLEDGE_FOLDER_ID,
+            name: DEFAULT_KNOWLEDGE_FOLDER_NAME,
+            type: "other",
+            createdAt: Date.now(),
+            updatedAt: Date.now()
+          }
+        ]
+      }
     }
     return loadResources(currentUser.id)
   })
@@ -134,6 +149,7 @@ const Resources: React.FC<ResourcesProps> = ({ onClose }) => {
                   title: knowledgeDraft.title.trim(),
                   content: knowledgeDraft.content.trim(),
                   url: knowledgeDraft.url.trim() || undefined,
+                  folderId: item.folderId || DEFAULT_KNOWLEDGE_FOLDER_ID,
                   updatedAt: Date.now()
                 }
               : item
@@ -144,7 +160,8 @@ const Resources: React.FC<ResourcesProps> = ({ onClose }) => {
       const newItem = createResourceItem({
         title: knowledgeDraft.title,
         content: knowledgeDraft.content,
-        url: knowledgeDraft.url
+        url: knowledgeDraft.url,
+        folderId: DEFAULT_KNOWLEDGE_FOLDER_ID
       })
       return { ...prev, knowledge: [newItem, ...prev.knowledge] }
     })

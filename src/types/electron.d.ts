@@ -73,6 +73,7 @@ export interface ElectronAPI {
   moveWindowRight: () => Promise<void>
   moveWindowUp: () => Promise<void>
   moveWindowDown: () => Promise<void>
+  resizeWindowBy: (payload: { deltaWidth: number; deltaHeight: number }) => Promise<void>
   analyzeAudioFromBase64: (data: string, mimeType: string) => Promise<{ text: string; timestamp: number }>
   analyzeAudioFile: (path: string) => Promise<{ text: string; timestamp: number }>
   getCurrentLlmConfig: () => Promise<{ provider: "ollama" | "groq"; model: string; isOllama: boolean }>
@@ -81,6 +82,40 @@ export interface ElectronAPI {
   switchToGroq: (apiKey?: string) => Promise<{ success: boolean; error?: string }>
   switchToGemini: (apiKey?: string) => Promise<{ success: boolean; error?: string }>
   testLlmConnection: () => Promise<{ success: boolean; error?: string }>
+  getRuntimeSecretsStatus: () => Promise<{
+    groqApiKeyConfigured: boolean
+    elevenLabsApiKeyConfigured: boolean
+  }>
+  setRuntimeSecrets: (payload: {
+    groqApiKey?: string
+    elevenLabsApiKey?: string
+  }) => Promise<{
+    success: boolean
+    status?: {
+      groqApiKeyConfigured: boolean
+      elevenLabsApiKeyConfigured: boolean
+    }
+    error?: string
+  }>
+  fetchUrlContent: (url: string) => Promise<{
+    success: boolean
+    url?: string
+    title?: string
+    content?: string
+    truncated?: boolean
+    source?: "direct" | "reader-proxy" | "browser-render" | "direct-lite"
+    error?: string
+  }>
+  extractDocumentText: (filePath: string, fileName?: string) => Promise<{
+    success: boolean
+    content?: string
+    error?: string
+  }>
+  extractDocumentTextFromUpload: (fileName: string, base64: string) => Promise<{
+    success: boolean
+    content?: string
+    error?: string
+  }>
   getIncognitoMode: () => Promise<{ enabled: boolean }>
   setIncognitoMode: (enabled: boolean) => Promise<{ success: boolean; enabled: boolean }>
   toggleIncognitoMode: () => Promise<{ success: boolean; enabled: boolean }>

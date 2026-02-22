@@ -26,6 +26,8 @@ const startUrl = isDev
   : `file://${resolveRendererIndex()}`
 
 const fallbackFileUrl = `file://${resolveRendererIndex()}`
+const MIN_WINDOW_WIDTH = 300
+const MIN_WINDOW_HEIGHT = 200
 
 export class WindowHelper {
   private mainWindow: BrowserWindow | null = null
@@ -40,6 +42,8 @@ export class WindowHelper {
   private step: number = 0
   private currentX: number = 0
   private currentY: number = 0
+  private isApplyingProgrammaticResize: boolean = false
+  private manualResizeLocked: boolean = false
 
   constructor(appState: AppState) {
     this.appState = appState
@@ -67,39 +71,105 @@ export class WindowHelper {
 
   public setWindowDimensions(width: number, height: number): void {
     if (!this.mainWindow || this.mainWindow.isDestroyed()) return
+    if (this.manualResizeLocked) return
 
-    // Get current window position
-    const [currentX, currentY] = this.mainWindow.getPosition()
+    const currentBounds = this.mainWindow.getBounds()
 
-    // Get screen dimensions
-    const primaryDisplay = screen.getPrimaryDisplay()
-    const workArea = primaryDisplay.workAreaSize
+    // Get screen dimensions for the display hosting this window.
+    const display = screen.getDisplayMatching(currentBounds)
+    const workArea = display.workArea
 
-    // Use 75% width if debugging has occurred, otherwise use 60%
-    const maxAllowedWidth = Math.floor(
-      workArea.width * (this.appState.getHasDebugged() ? 0.75 : 0.5)
+    // Allow wider layouts (Workspace, dashboard) to resize without clipping content.
+    const maxAllowedWidth = Math.max(
+      420,
+      Math.floor(workArea.width * (this.appState.getHasDebugged() ? 0.92 : 0.88))
+    )
+    const maxAllowedHeight = Math.max(MIN_WINDOW_HEIGHT, workArea.height)
+
+    // Ensure width/height stay in valid bounds.
+    const newWidth = Math.max(
+      MIN_WINDOW_WIDTH,
+      Math.min(Math.ceil(width + 32), maxAllowedWidth)
+    )
+    const newHeight = Math.max(
+      MIN_WINDOW_HEIGHT,
+      Math.min(Math.ceil(height), maxAllowedHeight)
     )
 
-    // Ensure width doesn't exceed max allowed width and height is reasonable
-    const newWidth = Math.min(width + 32, maxAllowedWidth)
-    const newHeight = Math.ceil(height)
-
-    // Center the window horizontally if it would go off screen
-    const maxX = workArea.width - newWidth
-    const newX = Math.min(Math.max(currentX, 0), maxX)
+    // Keep the top-left corner in the active display work area.
+    const minX = workArea.x
+    const maxX = workArea.x + workArea.width - newWidth
+    const newX = Math.min(Math.max(currentBounds.x, minX), maxX)
+    const minY = workArea.y
+    const maxY = workArea.y + workArea.height - newHeight
+    const newY = Math.min(Math.max(currentBounds.y, minY), maxY)
 
     // Update window bounds
-    this.mainWindow.setBounds({
+    this.setBoundsSafely({
       x: newX,
-      y: currentY,
+      y: newY,
       width: newWidth,
       height: newHeight
     })
 
     // Update internal state
-    this.windowPosition = { x: newX, y: currentY }
+    this.windowPosition = { x: newX, y: newY }
     this.windowSize = { width: newWidth, height: newHeight }
     this.currentX = newX
+    this.currentY = newY
+  }
+
+  public resizeWindowBy(deltaWidth: number, deltaHeight: number): void {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return
+    if (!Number.isFinite(deltaWidth) || !Number.isFinite(deltaHeight)) return
+
+    this.manualResizeLocked = true
+
+    const currentBounds = this.mainWindow.getBounds()
+    const display = screen.getDisplayMatching(currentBounds)
+    const workArea = display.workArea
+
+    const maxWidthFromPosition = Math.max(
+      MIN_WINDOW_WIDTH,
+      workArea.x + workArea.width - currentBounds.x
+    )
+    const maxHeightFromPosition = Math.max(
+      MIN_WINDOW_HEIGHT,
+      workArea.y + workArea.height - currentBounds.y
+    )
+
+    const width = Math.round(currentBounds.width + deltaWidth)
+    const height = Math.round(currentBounds.height + deltaHeight)
+    const nextWidth = Math.max(MIN_WINDOW_WIDTH, Math.min(width, maxWidthFromPosition))
+    const nextHeight = Math.max(
+      MIN_WINDOW_HEIGHT,
+      Math.min(height, maxHeightFromPosition)
+    )
+
+    this.setBoundsSafely({
+      x: currentBounds.x,
+      y: currentBounds.y,
+      width: nextWidth,
+      height: nextHeight
+    })
+
+    this.windowPosition = { x: currentBounds.x, y: currentBounds.y }
+    this.windowSize = { width: nextWidth, height: nextHeight }
+  }
+
+  private setBoundsSafely(bounds: {
+    x: number
+    y: number
+    width: number
+    height: number
+  }): void {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return
+    this.isApplyingProgrammaticResize = true
+    try {
+      this.mainWindow.setBounds(bounds)
+    } finally {
+      this.isApplyingProgrammaticResize = false
+    }
   }
 
   public createWindow(): void {
@@ -114,8 +184,8 @@ export class WindowHelper {
     const windowSettings: Electron.BrowserWindowConstructorOptions = {
       width: 400,
       height: 600,
-      minWidth: 300,
-      minHeight: 200,
+      minWidth: MIN_WINDOW_WIDTH,
+      minHeight: MIN_WINDOW_HEIGHT,
       webPreferences: {
         nodeIntegration: true,
         contextIsolation: true,
@@ -239,6 +309,9 @@ export class WindowHelper {
       if (this.mainWindow) {
         const bounds = this.mainWindow.getBounds()
         this.windowSize = { width: bounds.width, height: bounds.height }
+        if (!this.isApplyingProgrammaticResize) {
+          this.manualResizeLocked = true
+        }
       }
     })
 
@@ -278,7 +351,7 @@ export class WindowHelper {
     }
 
     if (this.windowPosition && this.windowSize) {
-      this.mainWindow.setBounds({
+      this.setBoundsSafely({
         x: this.windowPosition.x,
         y: this.windowPosition.y,
         width: this.windowSize.width,
@@ -318,7 +391,7 @@ export class WindowHelper {
     const centerY = Math.floor((workArea.height - windowHeight) / 2)
     
     // Set window position
-    this.mainWindow.setBounds({
+    this.setBoundsSafely({
       x: centerX,
       y: centerY,
       width: windowWidth,

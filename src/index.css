@@ -174,3 +174,35 @@ button, input, select, textarea, .interactive {
   justify-content: center;
   cursor: move;
 }
+
+/* Bottom-right grip for frameless window resizing */
+.window-resize-grip {
+  position: fixed;
+  right: 8px;
+  bottom: 8px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  cursor: nwse-resize;
+  -webkit-app-region: no-drag;
+  z-index: 2147483647;
+}
+
+.window-resize-grip::before {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  background:
+    linear-gradient(135deg, transparent 55%, rgba(255, 255, 255, 0.9) 56%, rgba(255, 255, 255, 0.9) 66%, transparent 67%),
+    linear-gradient(135deg, transparent 35%, rgba(255, 255, 255, 0.7) 36%, rgba(255, 255, 255, 0.7) 46%, transparent 47%),
+    linear-gradient(135deg, transparent 15%, rgba(255, 255, 255, 0.5) 16%, rgba(255, 255, 255, 0.5) 26%, transparent 27%);
+  opacity: 0.6;
+}
+
+.window-resize-grip:hover::before,
+.window-resize-grip-active::before {
+  opacity: 1;
+}

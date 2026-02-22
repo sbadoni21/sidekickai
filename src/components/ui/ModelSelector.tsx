@@ -1,28 +1,31 @@
 import React, { useEffect, useState } from "react"
 
 interface ModelConfig {
-  provider: "ollama" | "groq"
+  provider: "groq"
   model: string
-  isOllama: boolean
+  isOllama?: boolean
+}
+
+interface RuntimeSecretsStatus {
+  groqApiKeyConfigured: boolean
+  elevenLabsApiKeyConfigured: boolean
 }
 
 interface ModelSelectorProps {
-  onModelChange?: (provider: "ollama" | "groq", model: string) => void
+  onModelChange?: (provider: "groq", model: string) => void
   onChatOpen?: () => void
 }
 
 const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen }) => {
   const [currentConfig, setCurrentConfig] = useState<ModelConfig | null>(null)
-  const [availableOllamaModels, setAvailableOllamaModels] = useState<string[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [connectionStatus, setConnectionStatus] = useState<
     "testing" | "success" | "error" | null
   >(null)
   const [errorMessage, setErrorMessage] = useState("")
   const [groqApiKey, setGroqApiKey] = useState("")
-  const [selectedProvider, setSelectedProvider] = useState<"ollama" | "groq">("groq")
-  const [selectedOllamaModel, setSelectedOllamaModel] = useState<string>("")
-  const [ollamaUrl, setOllamaUrl] = useState<string>("http://localhost:11434")
+  const [elevenLabsApiKey, setElevenLabsApiKey] = useState("")
+  const [savedSecretsStatus, setSavedSecretsStatus] = useState<RuntimeSecretsStatus | null>(null)
 
   useEffect(() => {
     loadCurrentConfig()
@@ -32,31 +35,17 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
     try {
       setIsLoading(true)
       const config = await window.electronAPI.getCurrentLlmConfig()
-      setCurrentConfig(config)
-      setSelectedProvider(config.provider)
-
-      if (config.isOllama) {
-        setSelectedOllamaModel(config.model)
-        await loadOllamaModels()
-      }
+      setCurrentConfig({
+        provider: "groq",
+        model: config.model || "llama-3.3-70b-versatile",
+        isOllama: false
+      })
+      const status = await window.electronAPI.getRuntimeSecretsStatus()
+      setSavedSecretsStatus(status)
     } catch (error) {
       console.error("Error loading current config:", error)
     } finally {
       setIsLoading(false)
-    }
-  }
-
-  const loadOllamaModels = async () => {
-    try {
-      const models = await window.electronAPI.getAvailableOllamaModels()
-      setAvailableOllamaModels(models)
-
-      if (models.length > 0 && !selectedOllamaModel) {
-        setSelectedOllamaModel(models[0])
-      }
-    } catch (error) {
-      console.error("Error loading Ollama models:", error)
-      setAvailableOllamaModels([])
     }
   }
 
@@ -77,21 +66,29 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
   const handleProviderSwitch = async () => {
     try {
       setConnectionStatus("testing")
-      let result
+      const hasGroqInput = groqApiKey.trim().length > 0
+      const hasElevenLabsInput = elevenLabsApiKey.trim().length > 0
 
-      if (selectedProvider === "ollama") {
-        result = await window.electronAPI.switchToOllama(selectedOllamaModel, ollamaUrl)
-      } else {
-        result = await window.electronAPI.switchToGroq(groqApiKey || undefined)
+      if (hasGroqInput || hasElevenLabsInput) {
+        const saved = await window.electronAPI.setRuntimeSecrets({
+          ...(hasGroqInput ? { groqApiKey: groqApiKey.trim() } : {}),
+          ...(hasElevenLabsInput ? { elevenLabsApiKey: elevenLabsApiKey.trim() } : {})
+        })
+        if (!saved.success) {
+          setConnectionStatus("error")
+          setErrorMessage(saved.error || "Failed to save API keys")
+          return
+        }
       }
+
+      const result = await window.electronAPI.switchToGroq(groqApiKey || undefined)
 
       if (result.success) {
         await loadCurrentConfig()
+        setGroqApiKey("")
+        setElevenLabsApiKey("")
         setConnectionStatus("success")
-        onModelChange?.(
-          selectedProvider,
-          selectedProvider === "ollama" ? selectedOllamaModel : "llama-3.3-70b-versatile"
-        )
+        onModelChange?.("groq", "llama-3.3-70b-versatile")
         setTimeout(() => {
           onChatOpen?.()
         }, 500)
@@ -148,93 +145,40 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
 
       {currentConfig && (
         <div className="text-xs text-gray-600 bg-white/40 p-2 rounded">
-          Current: {currentConfig.provider === "ollama" ? "🏠" : "☁️"} {currentConfig.model}
+          Current: ☁️ {currentConfig.model}
+        </div>
+      )}
+
+      {savedSecretsStatus && (
+        <div className="text-xs text-gray-600 bg-white/30 p-2 rounded">
+          Stored keys: Groq {savedSecretsStatus.groqApiKeyConfigured ? "Yes" : "No"} | ElevenLabs{" "}
+          {savedSecretsStatus.elevenLabsApiKeyConfigured ? "Yes" : "No"}
         </div>
       )}
 
       <div className="space-y-2">
-        <label className="text-xs font-medium text-gray-700">Provider</label>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setSelectedProvider("groq")}
-            className={`flex-1 px-3 py-2 rounded text-xs transition-all ${
-              selectedProvider === "groq"
-                ? "bg-blue-500 text-white shadow-md"
-                : "bg-white/40 text-gray-700 hover:bg-white/60"
-            }`}
-          >
-            ☁️ Groq (Cloud)
-          </button>
-          <button
-            onClick={() => setSelectedProvider("ollama")}
-            className={`flex-1 px-3 py-2 rounded text-xs transition-all ${
-              selectedProvider === "ollama"
-                ? "bg-green-500 text-white shadow-md"
-                : "bg-white/40 text-gray-700 hover:bg-white/60"
-            }`}
-          >
-            🏠 Ollama (Local)
-          </button>
-        </div>
+        <label className="text-xs font-medium text-gray-700">
+          Groq API Key (optional if already set)
+        </label>
+        <input
+          type="password"
+          placeholder="Enter API key to update..."
+          value={groqApiKey}
+          onChange={event => setGroqApiKey(event.target.value)}
+          className="w-full px-3 py-2 text-xs bg-white/40 border border-white/60 rounded focus:outline-none focus:ring-2 focus:ring-blue-400/60"
+        />
+
+        <label className="text-xs font-medium text-gray-700">
+          ElevenLabs API Key (for meeting STT, optional)
+        </label>
+        <input
+          type="password"
+          placeholder="Enter ElevenLabs key to save locally..."
+          value={elevenLabsApiKey}
+          onChange={event => setElevenLabsApiKey(event.target.value)}
+          className="w-full px-3 py-2 text-xs bg-white/40 border border-white/60 rounded focus:outline-none focus:ring-2 focus:ring-blue-400/60"
+        />
       </div>
-
-      {selectedProvider === "groq" ? (
-        <div className="space-y-2">
-          <label className="text-xs font-medium text-gray-700">
-            Groq API Key (optional if already set)
-          </label>
-          <input
-            type="password"
-            placeholder="Enter API key to update..."
-            value={groqApiKey}
-            onChange={event => setGroqApiKey(event.target.value)}
-            className="w-full px-3 py-2 text-xs bg-white/40 border border-white/60 rounded focus:outline-none focus:ring-2 focus:ring-blue-400/60"
-          />
-        </div>
-      ) : (
-        <div className="space-y-2">
-          <div>
-            <label className="text-xs font-medium text-gray-700">Ollama URL</label>
-            <input
-              type="url"
-              value={ollamaUrl}
-              onChange={event => setOllamaUrl(event.target.value)}
-              className="w-full px-3 py-2 text-xs bg-white/40 border border-white/60 rounded focus:outline-none focus:ring-2 focus:ring-green-400/60"
-            />
-          </div>
-
-          <div>
-            <div className="flex items-center gap-2">
-              <label className="text-xs font-medium text-gray-700">Model</label>
-              <button
-                onClick={loadOllamaModels}
-                className="px-2 py-1 text-xs bg-white/60 hover:bg-white/80 rounded transition-all"
-                title="Refresh models"
-              >
-                🔄
-              </button>
-            </div>
-
-            {availableOllamaModels.length > 0 ? (
-              <select
-                value={selectedOllamaModel}
-                onChange={event => setSelectedOllamaModel(event.target.value)}
-                className="w-full px-3 py-2 text-xs bg-white/40 border border-white/60 rounded focus:outline-none focus:ring-2 focus:ring-green-400/60"
-              >
-                {availableOllamaModels.map(model => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <div className="text-xs text-gray-600 bg-yellow-100/60 p-2 rounded">
-                No Ollama models found. Make sure Ollama is running and models are installed.
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
       <div className="flex gap-2 pt-2">
         <button
@@ -256,10 +200,10 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
 
       <div className="text-xs text-gray-600 space-y-1">
         <div>
-          💡 <strong>Groq:</strong> Fast cloud inference, requires API key
+          💡 <strong>Cloud API mode:</strong> All answers use remote inference (no local model).
         </div>
         <div>
-          💡 <strong>Ollama:</strong> Private local inference, requires Ollama installation
+          💡 API keys are stored locally on this device for packaged `.exe` runs.
         </div>
       </div>
     </div>

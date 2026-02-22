@@ -161,7 +161,7 @@ export const ComplexitySection = ({
 )
 
 interface SolutionsProps {
-  setView: React.Dispatch<React.SetStateAction<"dashboard" | "queue" | "solutions" | "debug">>
+  setView: React.Dispatch<React.SetStateAction<"dashboard" | "queue" | "solutions" | "workspace" | "debug">>
 }
 
 const Solutions: React.FC<SolutionsProps> = ({ setView }) => {

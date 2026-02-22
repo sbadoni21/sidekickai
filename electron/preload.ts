@@ -95,6 +95,7 @@ interface ElectronAPI {
   moveWindowRight: () => Promise<void>
   moveWindowUp: () => Promise<void>
   moveWindowDown: () => Promise<void>
+  resizeWindowBy: (payload: { deltaWidth: number; deltaHeight: number }) => Promise<void>
   analyzeAudioFromBase64: (data: string, mimeType: string) => Promise<{ text: string; timestamp: number }>
   analyzeAudioFile: (path: string) => Promise<{ text: string; timestamp: number }>
   analyzeImageFile: (path: string) => Promise<void>
@@ -111,6 +112,40 @@ interface ElectronAPI {
   switchToGroq: (apiKey?: string) => Promise<{ success: boolean; error?: string }>
   switchToGemini: (apiKey?: string) => Promise<{ success: boolean; error?: string }>
   testLlmConnection: () => Promise<{ success: boolean; error?: string }>
+  getRuntimeSecretsStatus: () => Promise<{
+    groqApiKeyConfigured: boolean
+    elevenLabsApiKeyConfigured: boolean
+  }>
+  setRuntimeSecrets: (payload: {
+    groqApiKey?: string
+    elevenLabsApiKey?: string
+  }) => Promise<{
+    success: boolean
+    status?: {
+      groqApiKeyConfigured: boolean
+      elevenLabsApiKeyConfigured: boolean
+    }
+    error?: string
+  }>
+  fetchUrlContent: (url: string) => Promise<{
+    success: boolean
+    url?: string
+    title?: string
+    content?: string
+    truncated?: boolean
+    source?: "direct" | "reader-proxy" | "browser-render" | "direct-lite"
+    error?: string
+  }>
+  extractDocumentText: (filePath: string, fileName?: string) => Promise<{
+    success: boolean
+    content?: string
+    error?: string
+  }>
+  extractDocumentTextFromUpload: (fileName: string, base64: string) => Promise<{
+    success: boolean
+    content?: string
+    error?: string
+  }>
   
   // Audio Streaming API
   audio: {
@@ -186,6 +221,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   moveWindowRight: () => ipcRenderer.invoke("move-window-right"),
   moveWindowUp: () => ipcRenderer.invoke("move-window-up"),
   moveWindowDown: () => ipcRenderer.invoke("move-window-down"),
+  resizeWindowBy: (payload: { deltaWidth: number; deltaHeight: number }) =>
+    ipcRenderer.invoke("resize-window-by", payload),
 
   // Audio & Image Analysis
   analyzeAudioFromBase64: (data: string, mimeType: string) => 
@@ -326,6 +363,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   switchToGroq: (apiKey?: string) => ipcRenderer.invoke("switch-to-groq", apiKey),
   switchToGemini: (apiKey?: string) => ipcRenderer.invoke("switch-to-gemini", apiKey),
   testLlmConnection: () => ipcRenderer.invoke("test-llm-connection"),
+  getRuntimeSecretsStatus: () => ipcRenderer.invoke("get-runtime-secrets-status"),
+  setRuntimeSecrets: (payload: { groqApiKey?: string; elevenLabsApiKey?: string }) =>
+    ipcRenderer.invoke("set-runtime-secrets", payload),
+  fetchUrlContent: (url: string) => ipcRenderer.invoke("workspace:fetch-url-content", url),
+  extractDocumentText: (filePath: string, fileName?: string) =>
+    ipcRenderer.invoke("workspace:extract-document-text", { filePath, fileName }),
+  extractDocumentTextFromUpload: (fileName: string, base64: string) =>
+    ipcRenderer.invoke("workspace:extract-document-upload", { fileName, base64 }),
 
   // Audio Streaming API
   audio: {

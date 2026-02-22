@@ -2,7 +2,14 @@ import React, { useEffect, useRef, useState } from "react";
 import { MessageSquare, Mic, MicOff, Pause, Play, Terminal, X } from "lucide-react";
 import { cleanLLMResponse } from "../../utils/lmResponseParser";
 import { getCurrentUser } from "../../lib/authStore";
-import { loadResources, ResourceItem } from "../../lib/resourcesStore";
+import {
+  DEFAULT_KNOWLEDGE_FOLDER_ID,
+  loadResources,
+  ResourceItem,
+  RESOURCE_FOLDER_TYPE_LABELS,
+  UserResources
+} from "../../lib/resourcesStore";
+import { queryWorkspaceVectors } from "../../lib/upstashVectorStore";
 import type {
   AnswerAnalytics,
   CodingQuestionUnderstanding,
@@ -90,6 +97,16 @@ interface AnswerSuggestion {
   latencyMs?: number;
   provider?: string;
   model?: string;
+  deepDives?: AnswerDeepDive[];
+}
+
+interface AnswerDeepDive {
+  id: string;
+  prompt: string;
+  status: "pending" | "ready" | "error";
+  response?: string;
+  error?: string;
+  createdAt: number;
 }
 
 interface QuestionCandidate {
@@ -132,10 +149,63 @@ interface SttStatusPayload {
 interface MeetingModeProps {
   onClose: () => void;
   onMeetingSaved?: (meeting: Meeting) => Promise<void> | void;
+  endRequestToken?: number;
   compact?: boolean;
 }
 
-const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, compact = false }) => {
+interface ResourceScopeSelection {
+  resume: boolean;
+  jd: boolean;
+  resources: boolean;
+  jdIds: string[];
+  resourceFolderIds: string[];
+}
+
+const DEFAULT_RESOURCE_SCOPE_SELECTION: ResourceScopeSelection = {
+  resume: true,
+  jd: true,
+  resources: true,
+  jdIds: [],
+  resourceFolderIds: []
+};
+
+const RESOURCE_SCOPE_KEY_PREFIX = "cluely_meeting_resource_scope_v1_";
+
+const normalizeResourceScopeSelection = (
+  value: Partial<ResourceScopeSelection> | null | undefined
+): ResourceScopeSelection => ({
+  resume: value?.resume !== false,
+  jd: value?.jd !== false,
+  resources: value?.resources !== false,
+  jdIds: Array.isArray(value?.jdIds)
+    ? value!.jdIds.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [],
+  resourceFolderIds: Array.isArray(value?.resourceFolderIds)
+    ? value!.resourceFolderIds.filter(
+        (item): item is string => typeof item === "string" && item.trim().length > 0
+      )
+    : []
+});
+
+const loadResourceScopeSelection = (): ResourceScopeSelection => {
+  try {
+    const user = getCurrentUser();
+    if (!user) return DEFAULT_RESOURCE_SCOPE_SELECTION;
+    const raw = localStorage.getItem(`${RESOURCE_SCOPE_KEY_PREFIX}${user.id}`);
+    if (!raw) return DEFAULT_RESOURCE_SCOPE_SELECTION;
+    const parsed = JSON.parse(raw) as Partial<ResourceScopeSelection>;
+    return normalizeResourceScopeSelection(parsed);
+  } catch {
+    return DEFAULT_RESOURCE_SCOPE_SELECTION;
+  }
+};
+
+const MeetingMode: React.FC<MeetingModeProps> = ({
+  onClose,
+  onMeetingSaved,
+  endRequestToken = 0,
+  compact = false
+}) => {
   const sttProvider = (import.meta.env.VITE_STT_PROVIDER || "elevenlabs").toLowerCase();
   const useStreamingStt = sttProvider === "google" || sttProvider === "elevenlabs";
   const useChunkedStt = !useStreamingStt;
@@ -150,14 +220,18 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
   const [showDebug, setShowDebug] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [answers, setAnswers] = useState<AnswerSuggestion[]>([]);
+  const [isScreenAnswering, setIsScreenAnswering] = useState(false);
   const [sttStatus, setSttStatus] = useState<SttStatusPayload | null>(null);
   const [isEndingMeeting, setIsEndingMeeting] = useState(false);
+  const [resourceScopeSelection, setResourceScopeSelection] = useState<ResourceScopeSelection>(() =>
+    loadResourceScopeSelection()
+  );
   const [cpuMode, setCpuMode] = useState<CpuMode>("balanced");
   const [chunkRateMs, setChunkRateMs] = useState<number>(1800);
   const [maxChunkQueue, setMaxChunkQueue] = useState<number>(8);
   const [answerThrottleMs, setAnswerThrottleMs] = useState<number>(1200);
   const [modelThrottleMs, setModelThrottleMs] = useState<number>(800);
-  const [cloudOffload, setCloudOffload] = useState<boolean>(false);
+  const [cloudOffload] = useState<boolean>(true);
 
   const answerInFlightRef = useRef(false);
   const pendingAnswerRef = useRef<QuestionCandidate | null>(null);
@@ -176,6 +250,8 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
   const droppedLocalChunksRef = useRef(0);
   const modelLastCallAtRef = useRef(0);
   const cloudOffloadAttemptedRef = useRef(false);
+  const lastHandledEndRequestRef = useRef(0);
+  const vectorLookupWarningShownRef = useRef(false);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -210,6 +286,74 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
     const log: LogEntry = { timestamp: Date.now(), level, message };
     setLogs((prev) => [...prev.slice(-80), log]);
     console.log(`[${level.toUpperCase()}]`, message);
+  };
+
+  const getCurrentResources = (): UserResources => {
+    const user = getCurrentUser();
+    if (!user) {
+      return {
+        resume: "",
+        documents: [],
+        knowledge: [],
+        knowledgeFolders: []
+      };
+    }
+    return loadResources(user.id);
+  };
+
+  const getEffectiveSelectedJdIds = (resources: UserResources): Set<string> => {
+    const available = new Set(resources.documents.map((item) => item.id));
+    if (available.size === 0) return new Set<string>();
+    const configured = resourceScopeSelection.jdIds.filter((id) => available.has(id));
+    if (configured.length > 0) {
+      return new Set(configured);
+    }
+    return available;
+  };
+
+  const getEffectiveSelectedResourceFolderIds = (resources: UserResources): Set<string> => {
+    const available = new Set(
+      (resources.knowledgeFolders || []).map((folder) => folder.id)
+    );
+    if (available.size === 0) return new Set<string>();
+    const configured = resourceScopeSelection.resourceFolderIds.filter((id) => available.has(id));
+    if (configured.length > 0) {
+      return new Set(configured);
+    }
+    return available;
+  };
+
+  const getSelectedVectorFolders = (): Array<"resume" | "jd" | "resource"> => {
+    const folders: Array<"resume" | "jd" | "resource"> = [];
+    if (resourceScopeSelection.resume) folders.push("resume");
+    if (resourceScopeSelection.jd) folders.push("jd");
+    if (resourceScopeSelection.resources) folders.push("resource");
+    return folders;
+  };
+
+  const getSelectedFolderLabels = (): string[] => {
+    const resources = getCurrentResources();
+    const labels: string[] = [];
+    if (resourceScopeSelection.resume) labels.push("Resume");
+    if (resourceScopeSelection.jd) {
+      const jdIds = getEffectiveSelectedJdIds(resources);
+      labels.push(`Interview JD (${jdIds.size}/${resources.documents.length})`);
+    }
+    if (resourceScopeSelection.resources) {
+      const folderIds = getEffectiveSelectedResourceFolderIds(resources);
+      const selectedFolders = resources.knowledgeFolders.filter((folder) => folderIds.has(folder.id));
+      if (selectedFolders.length > 0) {
+        labels.push(
+          `Resources: ${selectedFolders
+            .slice(0, 3)
+            .map((folder) => folder.name)
+            .join(", ")}${selectedFolders.length > 3 ? "..." : ""}`
+        );
+      } else {
+        labels.push("Resources");
+      }
+    }
+    return labels;
   };
 
   const clamp01 = (value: number) =>
@@ -372,10 +516,17 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
 
   const questionStarterRegex =
     /^(what|why|how|when|where|who|which|can you|could you|would you|will you|tell me|walk me through|describe|explain|give me|do you|are you|have you|did you)\b/i;
+  const questionCueAnywhereRegex =
+    /\b(what|why|how|when|where|who|which|can you|could you|would you|will you|tell me|walk me through|describe|explain|give me|do you|are you|have you|did you)\b/i;
   const questionSignalRegex =
     /\b(explain|describe|walk me through|tell me|give me|compare|difference|trade-?off|approach|design|implement|optimi[sz]e|debug|why|how|what)\b/i;
   const technicalSignalRegex =
-    /\b(array|string|graph|tree|heap|stack|queue|hash|map|set|dp|dynamic programming|greedy|binary search|two pointer|sliding window|sort|time complexity|space complexity|big o|edge case|constraints?)\b/i;
+    /\b(array|string|graph|tree|heap|stack|queue|hash|map|set|dp|dynamic programming|greedy|binary search|two pointer|sliding window|sort|time complexity|space complexity|big o|edge case|constraints?|algorithm|data structure|api|database|schema|query|endpoint|auth|token|latency|throughput|memory|cpu|index|pipeline)\b/i;
+  const transformSignalRegex =
+    /\b(convert|conversion|transform|map|parse|serialize|deserialize|normalize|format|cast|truncate|migrate)\b/i;
+  const identifierSignalRegex = /\b(id|identifier|uuid|primary key|foreign key)\b/i;
+  const numericTransformSignalRegex =
+    /\b(from|to|into|between|vs|versus)\b.*\b\d+\b|\b\d+\b.*\b(from|to|into|between|vs|versus)\b/i;
   const problemStatementRegex =
     /\b(you are given|given an? (integer|array|string|graph|tree)|group size|return (true|false)|consecutive|divide the array|can be divided|output|find|determine)\b/i;
   const followUpRegex = /^(and|also|then|what about|how about|plus|one more|another)\b/i;
@@ -430,7 +581,21 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
       .split(/(?<=[?.!])\s+/)
       .map((item) => item.trim())
       .filter(Boolean);
-    return sentences.length > 0 ? sentences : [normalized];
+    const cueRegex = new RegExp(questionCueAnywhereRegex.source, "gi");
+    const cueSegments = Array.from(normalized.matchAll(cueRegex))
+      .map((match) => {
+        if (typeof match.index !== "number") return "";
+        return normalized
+          .slice(match.index)
+          .replace(/^(so|then|and|also)\s+/i, "")
+          .trim();
+      })
+      .filter((item) => item.length >= 14)
+      .slice(-4);
+
+    const all = [...sentences, ...cueSegments];
+    const unique = Array.from(new Set(all.map((item) => normalizeQuestionSignature(item))));
+    return unique.length > 0 ? unique : [normalized];
   };
 
   const scoreQuestionConfidence = (text: string): number => {
@@ -440,15 +605,29 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
     const words = normalized.split(" ").filter(Boolean);
     const hasQuestionMark = normalized.endsWith("?");
     const hasStarter = questionStarterRegex.test(normalized);
-    const hasSignal = questionSignalRegex.test(normalized) || technicalSignalRegex.test(normalized);
+    const hasEmbeddedCue = !hasStarter && questionCueAnywhereRegex.test(normalized);
+    const hasQuestionSignal = questionSignalRegex.test(normalized);
+    const hasTechnicalSignal = technicalSignalRegex.test(normalized);
+    const hasTransformSignal = transformSignalRegex.test(normalized);
+    const hasIdentifierSignal = identifierSignalRegex.test(normalized);
+    const hasNumericTransformSignal = numericTransformSignalRegex.test(normalized);
+    const hasSignal =
+      hasQuestionSignal ||
+      hasTechnicalSignal ||
+      hasTransformSignal ||
+      (hasIdentifierSignal && hasNumericTransformSignal);
     const hasProblemStatement = problemStatementRegex.test(normalized);
     const hasConfirmationTail = confirmationTailRegex.test(normalized);
     let score = 0;
 
     if (hasQuestionMark) score += 0.45;
     if (hasStarter) score += 0.32;
-    if (questionSignalRegex.test(normalized)) score += 0.18;
-    if (technicalSignalRegex.test(normalized)) score += 0.15;
+    if (hasEmbeddedCue) score += 0.24;
+    if (hasQuestionSignal) score += 0.18;
+    if (hasTechnicalSignal) score += 0.15;
+    if (hasTransformSignal) score += 0.12;
+    if (hasIdentifierSignal) score += 0.08;
+    if (hasNumericTransformSignal) score += 0.1;
     if (hasProblemStatement) score += 0.32;
     if (followUpRegex.test(normalized)) score += 0.12;
     if (words.length >= 7 && words.length <= 30) score += 0.1;
@@ -461,20 +640,42 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
     return Math.max(0, Math.min(1, score));
   };
 
+  const getQuestionDetectionThreshold = (question: string): number => {
+    const normalized = question.replace(/\s+/g, " ").trim();
+    const hasStarter = questionStarterRegex.test(normalized);
+    const hasSignal =
+      questionSignalRegex.test(normalized) ||
+      technicalSignalRegex.test(normalized) ||
+      transformSignalRegex.test(normalized) ||
+      (identifierSignalRegex.test(normalized) && numericTransformSignalRegex.test(normalized));
+    const hasQuestionMark = normalized.endsWith("?");
+    const hasProblemStatement = problemStatementRegex.test(normalized);
+
+    if (hasProblemStatement) return 0.42;
+    if (hasQuestionMark && (hasStarter || hasSignal)) return 0.46;
+    if (hasStarter && hasSignal) return 0.48;
+    if (hasStarter) return 0.5;
+    if (hasSignal) return 0.54;
+    return 0.62;
+  };
+
   const isLikelyInterviewQuestion = (question: string, confidence: number): boolean => {
     const normalized = question.replace(/\s+/g, " ").trim();
     const words = normalized.split(" ").filter(Boolean);
     const hasStarter = questionStarterRegex.test(normalized);
-    const hasSignal = questionSignalRegex.test(normalized) || technicalSignalRegex.test(normalized);
+    const hasSignal =
+      questionSignalRegex.test(normalized) ||
+      technicalSignalRegex.test(normalized) ||
+      transformSignalRegex.test(normalized) ||
+      (identifierSignalRegex.test(normalized) && numericTransformSignalRegex.test(normalized));
     const hasQuestionMark = normalized.endsWith("?");
     const hasProblemStatement = problemStatementRegex.test(normalized);
     const confirmationOnly = confirmationTailRegex.test(normalized) && words.length <= 12;
 
     if (confirmationOnly && !hasStarter) return false;
     if (!hasStarter && !hasSignal && !hasQuestionMark && !hasProblemStatement) return false;
-    if (words.length < 6 && !hasStarter) return false;
-    if (hasProblemStatement && confidence >= 0.38) return true;
-    if (confidence < 0.5) return false;
+    if (words.length < 5 && !hasStarter && !hasQuestionMark) return false;
+    if (confidence < getQuestionDetectionThreshold(normalized)) return false;
     return true;
   };
 
@@ -545,34 +746,111 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
     return scored.slice(0, limit).map((entry) => entry.item);
   };
 
-  const buildResourceContext = (question: string) => {
+  const buildResourceContext = async (question: string) => {
     const user = getCurrentUser();
     if (!user) return { context: "", sources: [] as string[] };
-
     const resources = loadResources(user.id);
-    const tokens = tokenize(question);
+    const selectedFolders = new Set(getSelectedVectorFolders());
+    const selectedJdIds = getEffectiveSelectedJdIds(resources);
+    const selectedResourceFolderIds = getEffectiveSelectedResourceFolderIds(resources);
+    if (selectedFolders.size === 0) {
+      return { context: "", sources: [] as string[] };
+    }
+
     const sections: string[] = [];
     const sources: string[] = [];
+    const maxLength = 4000;
 
-    if (resources.resume.trim()) {
+    try {
+      const vectorMatches = await queryWorkspaceVectors(user.id, question, 7);
+      const scopedMatches = vectorMatches.filter((item) => {
+        if (!selectedFolders.has(item.metadata.folder)) return false;
+        if (item.metadata.folder === "jd") {
+          return selectedJdIds.has(item.metadata.resourceId);
+        }
+        if (item.metadata.folder === "resource") {
+          if (selectedResourceFolderIds.size === 0) return false;
+          if (item.metadata.resourceFolderId) {
+            return selectedResourceFolderIds.has(item.metadata.resourceFolderId);
+          }
+          // Backward compatibility for vectors created before folder metadata.
+          return resourceScopeSelection.resources;
+        }
+        return true;
+      });
+      if (scopedMatches.length > 0) {
+        scopedMatches.forEach((item) => {
+          const label =
+            item.metadata.folder === "jd"
+              ? "INTERVIEW JD"
+              : item.metadata.folder === "resume"
+              ? "RESUME"
+              : `RESOURCE${
+                  item.metadata.resourceFolderName
+                    ? ` (${item.metadata.resourceFolderName}${
+                        item.metadata.resourceFolderType
+                          ? ` - ${RESOURCE_FOLDER_TYPE_LABELS[item.metadata.resourceFolderType]}`
+                          : ""
+                      })`
+                    : ""
+                }`;
+          sections.push(`${label}: ${item.metadata.title}\n${truncate(item.data.trim(), 800)}`);
+          if (item.metadata.title) {
+            sources.push(item.metadata.title);
+          }
+        });
+
+        const combined = sections.join("\n\n");
+        return {
+          context: combined.length > maxLength ? `${combined.slice(0, maxLength)}...` : combined,
+          sources
+        };
+      }
+    } catch (error: any) {
+      if (!vectorLookupWarningShownRef.current) {
+        vectorLookupWarningShownRef.current = true;
+        addLog("warning", `⚠️ Vector lookup failed, using local resources: ${error?.message || "unknown"}`);
+      }
+    }
+
+    const tokens = tokenize(question);
+
+    if (resourceScopeSelection.resume && resources.resume.trim()) {
       sections.push(`RESUME\n${truncate(resources.resume.trim(), 1200)}`);
       sources.push("Resume");
     }
 
-    const docSelections = selectRelevant(resources.documents, tokens, 3);
-    docSelections.forEach((item) => {
-      sections.push(`DOCUMENT: ${item.title}\n${truncate(item.content.trim(), 800)}`);
-      sources.push(item.title);
-    });
+    if (resourceScopeSelection.jd) {
+      const selectedDocs = resources.documents.filter((item) => selectedJdIds.has(item.id));
+      const docSelections = selectRelevant(selectedDocs, tokens, 3);
+      docSelections.forEach((item) => {
+        sections.push(`DOCUMENT: ${item.title}\n${truncate(item.content.trim(), 800)}`);
+        sources.push(item.title);
+      });
+    }
 
-    const knowledgeSelections = selectRelevant(resources.knowledge, tokens, 3);
-    knowledgeSelections.forEach((item) => {
-      sections.push(`KNOWLEDGE: ${item.title}\n${truncate(item.content.trim(), 800)}`);
-      sources.push(item.title);
-    });
+    if (resourceScopeSelection.resources) {
+      const scopedKnowledge = resources.knowledge.filter((item) =>
+        selectedResourceFolderIds.has(item.folderId || DEFAULT_KNOWLEDGE_FOLDER_ID)
+      );
+      const knowledgeSelections = selectRelevant(scopedKnowledge, tokens, 3);
+      knowledgeSelections.forEach((item) => {
+        const folderName =
+          resources.knowledgeFolders.find((folder) => folder.id === (item.folderId || ""))?.name ||
+          "General Resources";
+        const folderType =
+          resources.knowledgeFolders.find((folder) => folder.id === (item.folderId || ""))?.type || "other";
+        sections.push(
+          `KNOWLEDGE (${folderName} - ${RESOURCE_FOLDER_TYPE_LABELS[folderType]}): ${item.title}\n${truncate(
+            item.content.trim(),
+            800
+          )}`
+        );
+        sources.push(item.title);
+      });
+    }
 
     const combined = sections.join("\n\n");
-    const maxLength = 4000;
     return {
       context: combined.length > maxLength ? `${combined.slice(0, maxLength)}...` : combined,
       sources,
@@ -657,6 +935,39 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
     }
   };
 
+  const coerceLlmResponseText = (payload: unknown): string => {
+    if (typeof payload === "string") return payload;
+    if (payload && typeof payload === "object") {
+      const value = payload as Record<string, unknown>;
+      if (typeof value.text === "string") return value.text;
+      if (typeof value.response === "string") return value.response;
+    }
+    try {
+      return JSON.stringify(payload);
+    } catch {
+      return String(payload ?? "");
+    }
+  };
+
+  const DEFAULT_EXPANSION_SUGGESTIONS = [
+    "Add more details",
+    "Give a short code example",
+    "Mention pitfalls and edge cases"
+  ];
+
+  const getExpansionSuggestions = (item: AnswerSuggestion): string[] => {
+    const byKey = new Map<string, string>();
+    [...DEFAULT_EXPANSION_SUGGESTIONS, ...(item.followUps || [])].forEach((entry) => {
+      const normalized = entry.replace(/\s+/g, " ").trim();
+      if (!normalized) return;
+      const key = normalized.toLowerCase();
+      if (!byKey.has(key)) {
+        byKey.set(key, normalized);
+      }
+    });
+    return Array.from(byKey.values()).slice(0, 6);
+  };
+
   const maybeUseCloudOffload = async () => {
     if (!cloudOffload) return;
     if (cloudOffloadAttemptedRef.current) return;
@@ -728,12 +1039,14 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, onMeetingSaved, comp
     };
     setAnswers((prev) => [pendingAnswer, ...prev].slice(0, 24));
 
-    const { context } = buildResourceContext(trimmed);
+    const { context } = await buildResourceContext(trimmed);
     const user = getCurrentUser();
+    const selectedFolderLabels = getSelectedFolderLabels();
     const prompt = `You are an interview copilot for coding interviews.
 
 Candidate: ${user?.name || "Candidate"}
 Question source: ${candidate.source === "interviewer" ? "Interviewer" : "User"}
+Selected resource folders: ${selectedFolderLabels.join(", ") || "None"}
 
 Recent conversation context:
 ${candidate.contextWindow || "No recent context."}
@@ -840,6 +1153,236 @@ Rules:
     }
   };
 
+  const requestAnswerExpansion = async (answerId: string, suggestion: string) => {
+    const normalizedSuggestion = suggestion.replace(/\s+/g, " ").trim();
+    if (!normalizedSuggestion) return;
+
+    const selectedAnswer = answers.find((item) => item.id === answerId);
+    if (!selectedAnswer || selectedAnswer.status !== "ready" || !selectedAnswer.response) return;
+
+    const deepDiveId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const pendingDive: AnswerDeepDive = {
+      id: deepDiveId,
+      prompt: normalizedSuggestion,
+      status: "pending",
+      createdAt: Date.now()
+    };
+
+    setAnswers((prev) =>
+      prev.map((item) =>
+        item.id === answerId
+          ? {
+              ...item,
+              deepDives: [pendingDive, ...(item.deepDives || [])].slice(0, 6)
+            }
+          : item
+      )
+    );
+
+    try {
+      await maybeUseCloudOffload();
+      await applyModelThrottle();
+
+      const contextWindow = buildConversationContext(8);
+      const { context } = await buildResourceContext(`${selectedAnswer.question} ${normalizedSuggestion}`);
+      const prompt = `You are an interview copilot.
+
+Original interview question:
+${selectedAnswer.question}
+
+Current answer:
+${selectedAnswer.response}
+
+User follow-up request:
+${normalizedSuggestion}
+
+Recent conversation context:
+${contextWindow || "No recent context."}
+
+Candidate resources:
+${context || "No resources provided."}
+
+Return plain text only. Keep it concise, interview-ready, and actionable.
+If coding-related, include quick complexity and one edge case.`;
+
+      const raw = await window.electronAPI.invoke("llm-chat", prompt);
+      const expanded = cleanLLMResponse(coerceLlmResponseText(raw));
+
+      setAnswers((prev) =>
+        prev.map((item) =>
+          item.id === answerId
+            ? {
+                ...item,
+                deepDives: (item.deepDives || []).map((dive) =>
+                  dive.id === deepDiveId ? { ...dive, status: "ready", response: expanded } : dive
+                )
+              }
+            : item
+        )
+      );
+    } catch (error: any) {
+      const message = error?.message || "Failed to generate more details.";
+      setAnswers((prev) =>
+        prev.map((item) =>
+          item.id === answerId
+            ? {
+                ...item,
+                deepDives: (item.deepDives || []).map((dive) =>
+                  dive.id === deepDiveId ? { ...dive, status: "error", error: message } : dive
+                )
+              }
+            : item
+        )
+      );
+      addLog("error", `❌ Follow-up generation failed: ${message}`);
+    }
+  };
+
+  const handleAnswerFromScreen = async () => {
+    if (isScreenAnswering) return;
+    setIsScreenAnswering(true);
+
+    const screenQuestion = "Answer what is currently visible on screen";
+    const contextWindow = buildConversationContext(8);
+    const fallbackCandidate: QuestionCandidate = {
+      id: `screen-${Date.now()}`,
+      question: screenQuestion,
+      source: "user",
+      confidence: 0.92,
+      contextWindow,
+      detectedAt: Date.now(),
+      understanding: extractQuestionUnderstanding(screenQuestion, contextWindow)
+    };
+
+    const answerId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const pendingScreenAnswer: AnswerSuggestion = {
+      id: answerId,
+      questionId: fallbackCandidate.id,
+      question: screenQuestion,
+      status: "pending",
+      createdAt: Date.now(),
+      confidence: 100,
+      understanding: fallbackCandidate.understanding
+    };
+    setAnswers((prev) =>
+      [pendingScreenAnswer, ...prev].slice(0, 24)
+    );
+
+    try {
+      await maybeUseCloudOffload();
+
+      const screenshot = await window.electronAPI.invoke("take-screenshot");
+      const screenshotPath =
+        screenshot && typeof screenshot.path === "string" ? screenshot.path : "";
+      if (!screenshotPath) {
+        throw new Error("Failed to capture screen.");
+      }
+
+      await applyModelThrottle();
+      const visionRaw = await window.electronAPI.invoke("analyze-image-file", screenshotPath);
+      const screenSummary = cleanLLMResponse(coerceLlmResponseText(visionRaw));
+      if (!screenSummary.trim()) {
+        throw new Error("Screen analysis returned no text.");
+      }
+
+      const { context } = await buildResourceContext(`${screenQuestion} ${screenSummary}`);
+      const selectedFolderLabels = getSelectedFolderLabels();
+      const prompt = `You are an interview copilot for coding interviews.
+
+Task: The user clicked "Answer from screen". Use the analyzed screen content plus context to provide the most likely interview-ready answer.
+
+Screen analysis:
+${screenSummary}
+
+Recent conversation context:
+${contextWindow || "No recent context."}
+
+Selected resource folders:
+${selectedFolderLabels.join(", ") || "None"}
+
+Candidate resources:
+${context || "No resources provided."}
+
+Return STRICT JSON only (no markdown):
+{
+  "answer": "one concise interview-ready response under 140 words",
+  "follow_ups": ["optional short bullet 1", "optional short bullet 2"],
+  "question_understanding": {
+    "problem_statement": "normalized prompt",
+    "constraints": ["constraint 1"],
+    "edge_cases": ["edge case 1"]
+  },
+  "quality": {
+    "clarity": 0.0,
+    "correctness": 0.0,
+    "concision": 0.0,
+    "relevance": 0.0,
+    "overall": 0.0
+  }
+}`;
+
+      await applyModelThrottle();
+      const startedAt = Date.now();
+      const [response, config] = await Promise.all([
+        window.electronAPI.invoke("llm-chat", prompt),
+        window.electronAPI.getCurrentLlmConfig().catch(() => ({
+          provider: "groq" as const,
+          model: "unknown",
+          isOllama: false
+        }))
+      ]);
+      const latencyMs = Date.now() - startedAt;
+      const parsed = parseAnswerPayload(coerceLlmResponseText(response), fallbackCandidate);
+      const cleaned = cleanLLMResponse(parsed.answer);
+
+      const answerAnalytics: AnswerAnalytics = {
+        id: answerId,
+        questionId: fallbackCandidate.id,
+        question: screenQuestion,
+        answer: cleaned,
+        followUps: parsed.followUps,
+        provider: config.provider,
+        model: config.model,
+        createdAt: Date.now(),
+        latencyMs,
+        quality: parsed.quality
+      };
+      updateAnalyticsRef((current) => ({
+        ...current,
+        answers: [answerAnalytics, ...(current.answers || [])].slice(0, 80)
+      }));
+
+      setAnswers((prev) =>
+        prev.map((item) =>
+          item.id === answerId
+            ? {
+                ...item,
+                status: "ready",
+                response: cleaned,
+                followUps: parsed.followUps,
+                understanding: parsed.understanding,
+                qualityOverall: clamp01(parsed.quality.overall),
+                latencyMs,
+                provider: config.provider,
+                model: config.model
+              }
+            : item
+        )
+      );
+      addLog("success", "🖼️ Screen analyzed and answer generated.");
+    } catch (error: any) {
+      const message = error?.message || "Failed to answer from screen.";
+      setAnswers((prev) =>
+        prev.map((item) =>
+          item.id === answerId ? { ...item, status: "error", error: message } : item
+        )
+      );
+      addLog("error", `❌ Screen answer failed: ${message}`);
+    } finally {
+      setIsScreenAnswering(false);
+    }
+  };
+
   const formatSourceLabel = (source: MeetingAudioSource) => (source === "interviewer" ? "Interviewer" : "You");
 
   const toTranscriptPayload = (payload: string | LiveTranscriptPayload): LiveTranscriptPayload => {
@@ -855,12 +1398,13 @@ Rules:
     pendingDetectionRef.current = null;
     if (!pending) return;
 
-    const requiresLowerThreshold = problemStatementRegex.test(pending.question);
-    const threshold = requiresLowerThreshold ? 0.42 : 0.68;
+    const threshold = getQuestionDetectionThreshold(pending.question);
     if (pending.confidence < threshold) {
       addLog(
         "info",
-        `🧠 Ignored low-confidence question (${Math.round(pending.confidence * 100)}%): ${truncate(
+        `🧠 Ignored low-confidence question (${Math.round(pending.confidence * 100)}% < ${Math.round(
+          threshold * 100
+        )}%): ${truncate(
           pending.question,
           80
         )}`
@@ -1160,6 +1704,19 @@ Rules:
   }, [logs]);
 
   useEffect(() => {
+    const user = getCurrentUser();
+    if (!user) return;
+    try {
+      localStorage.setItem(
+        `${RESOURCE_SCOPE_KEY_PREFIX}${user.id}`,
+        JSON.stringify(resourceScopeSelection)
+      );
+    } catch {
+      // no-op
+    }
+  }, [resourceScopeSelection]);
+
+  useEffect(() => {
     if (transcriptScrollRef.current) {
       transcriptScrollRef.current.scrollTop = transcriptScrollRef.current.scrollHeight;
     }
@@ -1289,6 +1846,23 @@ Rules:
       if (questionDebounceRef.current) {
         clearTimeout(questionDebounceRef.current);
         questionDebounceRef.current = null;
+      }
+
+      const scopedResources = getCurrentResources();
+      const scopedJdIds = getEffectiveSelectedJdIds(scopedResources);
+      const scopedResourceFolderIds = getEffectiveSelectedResourceFolderIds(scopedResources);
+      const hasScopedKnowledge = scopedResources.knowledge.some((item) =>
+        scopedResourceFolderIds.has(item.folderId || DEFAULT_KNOWLEDGE_FOLDER_ID)
+      );
+      const hasScopedContext =
+        (resourceScopeSelection.resume && scopedResources.resume.trim().length > 0) ||
+        (resourceScopeSelection.jd && scopedJdIds.size > 0) ||
+        (resourceScopeSelection.resources && scopedResourceFolderIds.size > 0 && hasScopedKnowledge);
+
+      if (!hasScopedContext) {
+        addLog("warning", "⚠️ No resource folders selected. Answers will use live conversation only.");
+      } else {
+        addLog("info", `📚 Active folders: ${getSelectedFolderLabels().join(", ")}`);
       }
 
       const micStream = await navigator.mediaDevices.getUserMedia({
@@ -1563,6 +2137,15 @@ Rules:
     }
   };
 
+  useEffect(() => {
+    if (!endRequestToken) return;
+    if (endRequestToken === lastHandledEndRequestRef.current) return;
+    lastHandledEndRequestRef.current = endRequestToken;
+    handleEndMeeting().catch((error) => {
+      addLog("error", `❌ Failed to end meeting: ${error?.message || "unknown error"}`);
+    });
+  }, [endRequestToken]);
+
   const formatDuration = (seconds: number) => {
     const hrs = Math.floor(seconds / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
@@ -1572,7 +2155,55 @@ Rules:
       .padStart(2, "0")}`;
   };
 
+  const toggleJdSelection = (jdId: string) => {
+    setResourceScopeSelection((prev) => {
+      const resources = getCurrentResources();
+      const allIds = resources.documents.map((item) => item.id);
+      const next = new Set(prev.jdIds.length > 0 ? prev.jdIds : allIds);
+      if (next.has(jdId)) {
+        next.delete(jdId);
+      } else {
+        next.add(jdId);
+      }
+      const compacted = next.size === allIds.length ? [] : Array.from(next);
+      return {
+        ...prev,
+        jdIds: compacted
+      };
+    });
+  };
+
+  const toggleResourceFolderSelection = (folderId: string) => {
+    setResourceScopeSelection((prev) => {
+      const resources = getCurrentResources();
+      const allIds = resources.knowledgeFolders.map((folder) => folder.id);
+      const next = new Set(prev.resourceFolderIds.length > 0 ? prev.resourceFolderIds : allIds);
+      if (next.has(folderId)) {
+        next.delete(folderId);
+      } else {
+        next.add(folderId);
+      }
+      const compacted = next.size === allIds.length ? [] : Array.from(next);
+      return {
+        ...prev,
+        resourceFolderIds: compacted
+      };
+    });
+  };
+
   if (showTitleInput && !meeting) {
+    const currentUser = getCurrentUser();
+    const resources = currentUser
+      ? loadResources(currentUser.id)
+      : { resume: "", documents: [], knowledge: [], knowledgeFolders: [] };
+    const selectedJdIds = getEffectiveSelectedJdIds(resources);
+    const selectedResourceFolderIds = getEffectiveSelectedResourceFolderIds(resources);
+    const knowledgeCountByFolder = resources.knowledge.reduce<Record<string, number>>((acc, item) => {
+      const folderId = item.folderId || DEFAULT_KNOWLEDGE_FOLDER_ID;
+      acc[folderId] = (acc[folderId] || 0) + 1;
+      return acc;
+    }, {});
+
     return (
       <div className={`liquid-glass p-4 ${compact ? "w-[560px] max-w-[96vw]" : "w-full"}`}>
         <div className="mb-3 flex items-center justify-between">
@@ -1599,6 +2230,84 @@ Rules:
           onKeyDown={(e) => e.key === "Enter" && startRecording()}
           autoFocus
         />
+
+        <div className="mb-3 rounded-lg border border-white/30 bg-white/20 p-2">
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
+            RAG Folders (for interview answers)
+          </div>
+          <div className="space-y-1 text-[10px] text-gray-700">
+            <label className="flex items-center gap-2 rounded border border-white/35 bg-white/50 px-2 py-1">
+              <input
+                type="checkbox"
+                checked={resourceScopeSelection.resume}
+                onChange={(event) =>
+                  setResourceScopeSelection((prev) => ({ ...prev, resume: event.target.checked }))
+                }
+              />
+              Resume ({resources.resume.trim() ? "available" : "empty"})
+            </label>
+            <label className="flex items-center gap-2 rounded border border-white/35 bg-white/50 px-2 py-1">
+              <input
+                type="checkbox"
+                checked={resourceScopeSelection.jd}
+                onChange={(event) =>
+                  setResourceScopeSelection((prev) => ({ ...prev, jd: event.target.checked }))
+                }
+              />
+              Interview JD ({selectedJdIds.size}/{resources.documents.length})
+            </label>
+            {resourceScopeSelection.jd && resources.documents.length > 0 && (
+              <div className="rounded border border-white/30 bg-white/35 p-1.5">
+                <div className="mb-1 text-[9px] font-semibold text-gray-700">Choose JD file(s)</div>
+                <div className="max-h-20 space-y-1 overflow-y-auto">
+                  {resources.documents.map((item) => (
+                    <label key={item.id} className="flex items-center gap-2 text-[9px] text-gray-700">
+                      <input
+                        type="checkbox"
+                        checked={selectedJdIds.has(item.id)}
+                        onChange={() => toggleJdSelection(item.id)}
+                      />
+                      <span className="truncate">{item.title}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+            <label className="flex items-center gap-2 rounded border border-white/35 bg-white/50 px-2 py-1">
+              <input
+                type="checkbox"
+                checked={resourceScopeSelection.resources}
+                onChange={(event) =>
+                  setResourceScopeSelection((prev) => ({ ...prev, resources: event.target.checked }))
+                }
+              />
+              Resource Folders ({selectedResourceFolderIds.size}/{resources.knowledgeFolders.length})
+            </label>
+            {resourceScopeSelection.resources && resources.knowledgeFolders.length > 0 && (
+              <div className="rounded border border-white/30 bg-white/35 p-1.5">
+                <div className="mb-1 text-[9px] font-semibold text-gray-700">Choose resource folders</div>
+                <div className="max-h-24 space-y-1 overflow-y-auto">
+                  {resources.knowledgeFolders.map((folder) => (
+                    <label key={folder.id} className="flex items-center gap-2 text-[9px] text-gray-700">
+                      <input
+                        type="checkbox"
+                        checked={selectedResourceFolderIds.has(folder.id)}
+                        onChange={() => toggleResourceFolderSelection(folder.id)}
+                      />
+                      <span className="truncate">
+                        {folder.name} [{RESOURCE_FOLDER_TYPE_LABELS[folder.type]}] (
+                        {knowledgeCountByFolder[folder.id] || 0})
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="mt-2 text-[9px] text-gray-600">
+            AI will search only selected folders and can use multiple folders together.
+          </div>
+        </div>
 
         <div className="mb-3 rounded-lg border border-white/30 bg-white/20 p-2">
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
@@ -1643,9 +2352,10 @@ Rules:
               <input
                 type="checkbox"
                 checked={cloudOffload}
-                onChange={(event) => setCloudOffload(event.target.checked)}
+                readOnly
+                disabled
               />
-              Cloud offload answers
+              Cloud API answers (API-only)
             </label>
           </div>
         </div>
@@ -1822,7 +2532,21 @@ Rules:
         <div className="glass-content max-h-[52vh] overflow-y-auto rounded-lg border border-white/20 bg-white/10 p-3 shadow-lg">
           <div className="mb-2 flex items-center justify-between">
             <h3 className="text-[11px] font-bold text-gray-800">AI Answers</h3>
-            <span className="text-[9px] text-gray-500">{answers.length} items</span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleAnswerFromScreen}
+                disabled={isScreenAnswering}
+                className={`rounded border px-2 py-1 text-[9px] font-semibold transition ${
+                  isScreenAnswering
+                    ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-500"
+                    : "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+                }`}
+              >
+                {isScreenAnswering ? "Analyzing screen..." : "Answer from screen"}
+              </button>
+              <span className="text-[9px] text-gray-500">{answers.length} items</span>
+            </div>
           </div>
 
           {answers.length === 0 ? (
@@ -1867,14 +2591,61 @@ Rules:
                   {item.status === "ready" && item.response && (
                     <div className="space-y-2">
                       <div className="whitespace-pre-wrap text-[10px] text-gray-800">{item.response}</div>
-                      {item.followUps && item.followUps.length > 0 && (
-                        <div className="rounded bg-slate-50 px-2 py-1 text-[9px] text-slate-700">
-                          <div className="mb-1 font-semibold">Optional follow-ups</div>
-                          {item.followUps.map((followUp, index) => (
-                            <div key={`${item.id}-followup-${index}`}>• {followUp}</div>
-                          ))}
+
+                      <div className="rounded bg-slate-50 px-2 py-1 text-[9px] text-slate-700">
+                        <div className="mb-1 font-semibold">Need another angle?</div>
+                        <div className="flex flex-wrap gap-1">
+                          {getExpansionSuggestions(item).map((suggestion) => {
+                            const pendingSamePrompt = Boolean(
+                              (item.deepDives || []).find(
+                                (dive) =>
+                                  dive.status === "pending" &&
+                                  dive.prompt.toLowerCase() === suggestion.toLowerCase()
+                              )
+                            );
+                            return (
+                              <button
+                                key={`${item.id}-expand-${suggestion}`}
+                                type="button"
+                                disabled={pendingSamePrompt}
+                                onClick={() => requestAnswerExpansion(item.id, suggestion)}
+                                className={`rounded border px-2 py-0.5 text-[9px] ${
+                                  pendingSamePrompt
+                                    ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-500"
+                                    : "border-slate-300 bg-white text-slate-700 hover:bg-slate-100"
+                                }`}
+                              >
+                                {pendingSamePrompt ? `${suggestion}...` : suggestion}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {item.deepDives && item.deepDives.length > 0 && (
+                        <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[9px] text-amber-900">
+                          <div className="mb-1 font-semibold">More details</div>
+                          <div className="space-y-1">
+                            {item.deepDives.map((dive) => (
+                              <div key={dive.id} className="rounded border border-amber-100 bg-white/70 px-2 py-1">
+                                <div className="mb-0.5 text-[8px] font-semibold text-amber-700">{dive.prompt}</div>
+                                {dive.status === "pending" && (
+                                  <div className="text-[8px] text-amber-700">Generating details...</div>
+                                )}
+                                {dive.status === "error" && (
+                                  <div className="text-[8px] text-red-600">{dive.error || "Failed to generate details."}</div>
+                                )}
+                                {dive.status === "ready" && (
+                                  <div className="whitespace-pre-wrap text-[9px] text-amber-900">
+                                    {dive.response}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       )}
+
                       {item.understanding && (
                         <div className="rounded bg-indigo-50 px-2 py-1 text-[9px] text-indigo-700">
                           <div className="font-semibold">Extracted constraints / edge cases</div>
