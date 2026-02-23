@@ -504,11 +504,6 @@ body {
   -webkit-backdrop-filter: blur(16px) saturate(130%);
 }
 
-.meeting-overlay-page .meeting-mode-live h3,
-.meeting-overlay-page .meeting-mode-live p {
-  color: rgba(241, 245, 249, 0.95);
-}
-
 .meeting-section {
   border: 1px solid #d2dded;
   background: #f8fbff;
