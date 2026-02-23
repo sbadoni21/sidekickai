@@ -1416,6 +1416,10 @@ Return STRICT JSON only (no markdown):
       try {
         while (chunkQueueRef.current.length > 0) {
           if (!meetingStateRef.current.isRecording || meetingStateRef.current.isPaused) break;
+          if (!micEnabledRef.current) {
+            chunkQueueRef.current = [];
+            break;
+          }
           const nextChunk = chunkQueueRef.current.shift();
           if (!nextChunk) continue;
 
@@ -1453,6 +1457,7 @@ Return STRICT JSON only (no markdown):
     recorder.ondataavailable = (event: BlobEvent) => {
       if (!event.data || event.data.size === 0) return;
       if (!meetingStateRef.current.isRecording || meetingStateRef.current.isPaused) return;
+      if (!micEnabledRef.current) return;
 
       chunkQueueRef.current.push(event.data);
       if (chunkQueueRef.current.length > maxChunkQueue) {
@@ -1522,6 +1527,7 @@ Return STRICT JSON only (no markdown):
     workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
       const state = meetingStateRef.current;
       if (!state.isRecording || state.isPaused) return;
+      if (source === "user" && !micEnabledRef.current) return;
       window.electronAPI.audio.sendPCM(event.data, source);
     };
 
@@ -1577,6 +1583,10 @@ Return STRICT JSON only (no markdown):
       isPaused: Boolean(meeting?.isPaused),
     };
   }, [meeting?.isPaused, meeting?.isRecording]);
+
+  useEffect(() => {
+    micEnabledRef.current = isMicEnabled;
+  }, [isMicEnabled]);
 
   useEffect(() => {
     addLog("info", "🎬 Meeting mode started");
@@ -1680,6 +1690,8 @@ Return STRICT JSON only (no markdown):
       setLiveTranscript(null);
       setPartialTranscript(null);
       setAnswers([]);
+      setIsMicEnabled(true);
+      micEnabledRef.current = true;
       transcriptHistoryRef.current = [];
       pendingAnswerRef.current = null;
       pendingDetectionRef.current = null;
@@ -1748,6 +1760,9 @@ Return STRICT JSON only (no markdown):
         },
       });
       micStreamRef.current = micStream;
+      micStream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
       addLog("success", "✅ Mic capture enabled");
 
       const activeSources: MeetingAudioSource[] = ["user"];
@@ -1837,6 +1852,8 @@ Return STRICT JSON only (no markdown):
       }, 1000);
     } catch (err: any) {
       meetingStateRef.current = { isRecording: false, isPaused: false };
+      micEnabledRef.current = true;
+      setIsMicEnabled(true);
       await teardownAudioCapture();
       if (meetingStarted) {
         try {
@@ -1900,6 +1917,28 @@ Return STRICT JSON only (no markdown):
     }
   };
 
+  const toggleMicCapture = () => {
+    if (!meeting?.isRecording) return;
+    const nextEnabled = !micEnabledRef.current;
+    micEnabledRef.current = nextEnabled;
+    setIsMicEnabled(nextEnabled);
+
+    if (micStreamRef.current) {
+      micStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = nextEnabled;
+      });
+    }
+
+    if (!nextEnabled) {
+      chunkQueueRef.current = [];
+      setPartialTranscript(null);
+      addLog("warning", "🔇 Mic muted (your voice is not being transcribed)");
+      return;
+    }
+
+    addLog("success", "🎤 Mic unmuted");
+  };
+
   const stopRecording = async () => {
     if (!meeting?.isRecording) return;
     pendingDetectionRef.current = null;
@@ -1935,6 +1974,8 @@ Return STRICT JSON only (no markdown):
     }));
     await syncMeetingAnalytics(true);
     meetingStateRef.current = { isRecording: false, isPaused: false };
+    micEnabledRef.current = true;
+    setIsMicEnabled(true);
 
     await teardownAudioCapture();
     if (durationIntervalRef.current) {
@@ -2339,11 +2380,13 @@ Return STRICT JSON only (no markdown):
                 {meeting.isPaused ? "Resume" : "Pause"}
               </button>
               <button
-                onClick={stopRecording}
-                className="flex items-center gap-1 rounded bg-gray-600/80 px-2 py-1 text-xs text-white hover:bg-gray-700/80"
+                onClick={toggleMicCapture}
+                className={`flex items-center gap-1 rounded px-2 py-1 text-xs text-white ${
+                  isMicEnabled ? "bg-emerald-600/80 hover:bg-emerald-700/80" : "bg-slate-600/80 hover:bg-slate-700/80"
+                }`}
               >
-                <MicOff className="h-3 w-3" />
-                Stop
+                {isMicEnabled ? <Mic className="h-3 w-3" /> : <MicOff className="h-3 w-3" />}
+                {isMicEnabled ? "Mic On" : "Mic Off"}
               </button>
             </>
           )}
