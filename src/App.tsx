@@ -9,6 +9,7 @@ import type { MouseEvent as ReactMouseEvent } from "react"
 import Solutions from "./_pages/Solutions"
 import Dashboard from "./_pages/Dashboard"
 import Workspace from "./_pages/Workspace"
+import AppNavbar, { AppNavbarTarget } from "./components/ui/AppNavbar"
 import { QueryClient, QueryClientProvider } from "react-query"
 import { getCurrentUser, logoutUser, StoredUser } from "./lib/authStore"
 import { RuntimeMeeting, saveMeetingRecord } from "./lib/meetingsStore"
@@ -87,7 +88,11 @@ const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(() =>
     getCurrentUser()
   )
+  const [isIncognitoMode, setIsIncognitoMode] = useState(false)
+  const [isIncognitoAnimating, setIsIncognitoAnimating] = useState(false)
+  const [isIncognitoBusy, setIsIncognitoBusy] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
+  const hasLoadedIncognitoRef = useRef(false)
   const resizeStateRef = useRef<WindowResizeState>({
     active: false,
     lastScreenX: 0,
@@ -156,7 +161,7 @@ const App: React.FC = () => {
       resizeObserver.disconnect()
       mutationObserver.disconnect()
     }
-  }, [view, isWindowResizing]) // Re-run when view or resize mode changes
+  }, [view, queueMode, isWindowResizing]) // Re-run when view/meeting mode or resize mode changes
 
   useEffect(() => {
     if (!electronAPI) {
@@ -270,6 +275,46 @@ const App: React.FC = () => {
     }
   }, [isWindowResizing, electronAPI])
 
+  useEffect(() => {
+    if (!currentUser || !electronAPI?.getIncognitoMode || !electronAPI?.onIncognitoModeChanged) {
+      return
+    }
+
+    let mounted = true
+
+    const loadCurrentState = async () => {
+      try {
+        const state = await electronAPI.getIncognitoMode()
+        if (!mounted) return
+        setIsIncognitoMode(Boolean(state.enabled))
+        hasLoadedIncognitoRef.current = true
+      } catch (error) {
+        console.error("Failed to load incognito mode:", error)
+      }
+    }
+
+    loadCurrentState()
+
+    const unsubscribe = electronAPI.onIncognitoModeChanged((enabled: boolean) => {
+      if (!mounted) return
+      setIsIncognitoMode(Boolean(enabled))
+    })
+
+    return () => {
+      mounted = false
+      unsubscribe?.()
+    }
+  }, [currentUser, electronAPI])
+
+  useEffect(() => {
+    if (!hasLoadedIncognitoRef.current) return
+    setIsIncognitoAnimating(true)
+    const timeout = window.setTimeout(() => {
+      setIsIncognitoAnimating(false)
+    }, 680)
+    return () => window.clearTimeout(timeout)
+  }, [isIncognitoMode])
+
   const handleResizeMouseDown = (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.preventDefault()
     event.stopPropagation()
@@ -328,6 +373,42 @@ const App: React.FC = () => {
     }
   }
 
+  const isMeetingOverlayView = view === "queue" && queueMode === "meeting"
+
+  const handleToggleIncognitoMode = async () => {
+    if (!electronAPI?.toggleIncognitoMode || isIncognitoBusy) return
+    setIsIncognitoBusy(true)
+    try {
+      const result = await electronAPI.toggleIncognitoMode()
+      setIsIncognitoMode(Boolean(result?.enabled))
+    } catch (error) {
+      console.error("Failed to toggle incognito mode:", error)
+    } finally {
+      setIsIncognitoBusy(false)
+    }
+  }
+
+  const handleAppNavigation = (target: AppNavbarTarget) => {
+    if (target === "dashboard") {
+      setQueueMode("full")
+      setView("dashboard")
+      return
+    }
+    if (target === "assistant") {
+      setQueueMode("full")
+      setView("queue")
+      return
+    }
+    if (target === "meeting") {
+      setQueueMode("meeting")
+      setView("queue")
+      return
+    }
+    if (target === "workspace") {
+      setView("workspace")
+    }
+  }
+
   if (!currentUser) {
     return (
       <div ref={containerRef} className="min-h-0 relative app-window-shell">
@@ -344,31 +425,56 @@ const App: React.FC = () => {
   }
 
   return (
-    <div ref={containerRef} className="min-h-0 relative app-window-shell">
+    <div
+      ref={containerRef}
+      className={`min-h-0 relative app-window-shell ${
+        isIncognitoMode ? "app-incognito-mode" : ""
+      } ${isIncognitoAnimating ? "app-incognito-animating" : ""} ${
+        isMeetingOverlayView ? "app-window-shell-meeting" : ""
+      }`}
+    >
       <QueryClientProvider client={queryClient}>
         <ToastProvider>
-          {view === "dashboard" ? (
-            <Dashboard
+          <div className="app-auth-layout h-full w-full">
+            <AppNavbar
               user={currentUser}
-              refreshKey={dashboardRefreshKey}
-              onOpenNewMeeting={handleOpenNewMeeting}
-              onOpenWorkspace={handleOpenWorkspace}
+              currentView={view}
+              queueMode={queueMode}
+              isIncognitoMode={isIncognitoMode}
+              isIncognitoBusy={isIncognitoBusy}
+              onNavigate={handleAppNavigation}
+              onToggleIncognito={handleToggleIncognitoMode}
               onLogout={handleLogout}
             />
-          ) : view === "queue" ? (
-            <Queue
-              setView={setView}
-              mode={queueMode}
-              onExitToDashboard={handleExitToDashboard}
-              onMeetingSaved={handleMeetingSaved}
-            />
-          ) : view === "workspace" ? (
-            <Workspace onBackToDashboard={handleExitToDashboard} />
-          ) : view === "solutions" ? (
-            <Solutions setView={setView} />
-          ) : (
-            <></>
-          )}
+            <div
+              className={`app-auth-content min-h-0 flex-1 overflow-auto ${
+                isMeetingOverlayView ? "app-auth-content-meeting" : ""
+              }`}
+            >
+              {view === "dashboard" ? (
+                <Dashboard
+                  user={currentUser}
+                  refreshKey={dashboardRefreshKey}
+                  onOpenNewMeeting={handleOpenNewMeeting}
+                  onOpenWorkspace={handleOpenWorkspace}
+                  onLogout={handleLogout}
+                />
+              ) : view === "queue" ? (
+                <Queue
+                  setView={setView}
+                  mode={queueMode}
+                  onExitToDashboard={handleExitToDashboard}
+                  onMeetingSaved={handleMeetingSaved}
+                />
+              ) : view === "workspace" ? (
+                <Workspace onBackToDashboard={handleExitToDashboard} />
+              ) : view === "solutions" ? (
+                <Solutions setView={setView} />
+              ) : (
+                <></>
+              )}
+            </div>
+          </div>
           <ToastViewport />
         </ToastProvider>
       </QueryClientProvider>

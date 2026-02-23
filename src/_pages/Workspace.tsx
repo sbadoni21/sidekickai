@@ -848,7 +848,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
 
     return (
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
-        <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <section className="app-surface-card app-anim-rise rounded-2xl p-4">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <h2 className="text-xs font-semibold text-slate-900">{title}</h2>
             <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700">
@@ -965,7 +965,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
           )}
         </section>
 
-        <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <section className="app-surface-card app-anim-rise rounded-2xl p-4">
           <h2 className="mb-1 text-xs font-semibold text-slate-900">
             {editingId ? "Edit File" : "Add New File"}
           </h2>
@@ -1052,9 +1052,9 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
   }
 
   return (
-    <div className="min-h-[680px] w-full bg-white p-0">
-      <div className="mx-auto w-full max-w-[1460px] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[0_20px_55px_rgba(15,23,42,0.2)]">
-        <div className="auth-drag-handle mx-5 mt-4 rounded-xl border border-slate-300/80 bg-slate-100/90 py-1.5">
+    <div className="app-page-shell min-h-[680px] w-full p-0">
+      <div className="app-page-surface mx-auto w-full max-w-[1460px] overflow-hidden rounded-2xl border border-slate-200 shadow-[0_20px_55px_rgba(15,23,42,0.2)]">
+        <div className="app-drag-pill auth-drag-handle mx-5 mt-4 rounded-xl py-1.5">
           <span className="pointer-events-none select-none text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
             Drag top bar to move window
           </span>
@@ -1067,16 +1067,16 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
                 <button
                   type="button"
                   onClick={onBackToDashboard}
-                  className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+                  className="app-btn app-btn-secondary rounded-lg px-3 py-1.5 text-xs text-slate-700"
                 >
                   <span className="inline-flex items-center gap-1.5">
                     <ArrowLeft className="h-3.5 w-3.5" />
                     Dashboard
                   </span>
                 </button>
-                <h1 className="text-sm font-semibold text-slate-900">Workspace</h1>
+                <h1 className="text-lg font-semibold text-slate-900">Workspace</h1>
               </div>
-              <p className="text-xs text-slate-600">
+              <p className="text-sm text-slate-600">
                 Organize interview JD files and resource folders for faster AI answers.
               </p>
               <p className="mt-1 text-xs text-slate-500">{currentUser.email}</p>
@@ -1086,7 +1086,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
               type="button"
               onClick={() => runVectorSync(resources)}
               disabled={isSyncing}
-              className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-60"
+              className="app-btn app-btn-primary rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-60"
             >
               <span className="inline-flex items-center gap-2">
                 <RefreshCw className={`h-3.5 w-3.5 ${isSyncing ? "animate-spin" : ""}`} />
@@ -1108,7 +1108,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
         </header>
 
         <div className="grid grid-cols-1 lg:grid-cols-[250px_minmax(0,1fr)]">
-          <aside className="border-r border-slate-200 bg-slate-50 p-3">
+          <aside className="border-r border-slate-200 bg-slate-50/75 p-3">
             <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">
               Folders
             </div>
@@ -1169,7 +1169,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
               </button>
             </div>
 
-            <div className="mt-5 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+            <div className="app-surface-card mt-5 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
               <div className="text-xs font-semibold text-emerald-800">Best Practices (Faster AI)</div>
               <ol className="mt-2 list-decimal space-y-1 pl-4 text-xs leading-5 text-emerald-900">
                 <li>Keep one JD/topic per file with a clear title.</li>
@@ -1183,7 +1183,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
 
           <main className="bg-slate-50/40 p-4">
             {activeFolder === "resume" ? (
-              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <section className="app-surface-card app-anim-rise rounded-2xl p-5">
                 <h2 className="mb-1 text-xs font-semibold text-slate-900">Resume</h2>
                 <p className="mb-3 text-xs text-slate-600">
                   Used for personalization and response style during interview support.
@@ -1236,7 +1236,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
               )
             ) : (
               <div className="space-y-4">
-                <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <section className="app-surface-card app-anim-rise rounded-2xl p-4">
                   <div className="mb-3 flex items-center justify-between gap-2">
                     <div>
                       <h2 className="text-xs font-semibold text-slate-900">Resource Folders</h2>
@@ -1290,7 +1290,7 @@ const Workspace: React.FC<WorkspaceProps> = ({ onBackToDashboard }) => {
                   </div>
                 </section>
 
-                <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <section className="app-surface-card app-anim-rise rounded-2xl p-4">
                   <h3 className="mb-1 text-xs font-semibold text-slate-900">
                     Import Into: {activeKnowledgeFolder?.name || "General Resources"}
                   </h3>

@@ -5,11 +5,23 @@ import { getCurrentUser } from "../../lib/authStore";
 import {
   DEFAULT_KNOWLEDGE_FOLDER_ID,
   loadResources,
-  ResourceItem,
   RESOURCE_FOLDER_TYPE_LABELS,
   UserResources
 } from "../../lib/resourcesStore";
-import { queryWorkspaceVectors } from "../../lib/upstashVectorStore";
+import {
+  generateFastDraftAnswer,
+  generateRefinedAnswer,
+  judgeAnswerQuality,
+  parseAnswerEnvelope
+} from "../../lib/meetingAI/answerEngine";
+import {
+  buildHeuristicQuestionCandidate,
+  buildQuestionUnderstanding,
+  classifyQuestionIntentWithModel,
+  getQuestionDetectionThreshold,
+  normalizeQuestionSignature
+} from "../../lib/meetingAI/questionDetection";
+import { buildHybridResourceContext } from "../../lib/meetingAI/ragContext";
 import type {
   AnswerAnalytics,
   CodingQuestionUnderstanding,
@@ -88,13 +100,18 @@ interface AnswerSuggestion {
   question: string;
   response?: string;
   status: "pending" | "ready" | "error";
+  stage?: "draft" | "refined";
+  isRefining?: boolean;
   createdAt: number;
   error?: string;
   confidence?: number;
   followUps?: string[];
   understanding?: CodingQuestionUnderstanding;
   qualityOverall?: number;
+  qualityNotes?: string;
   latencyMs?: number;
+  draftLatencyMs?: number;
+  refineLatencyMs?: number;
   provider?: string;
   model?: string;
   deepDives?: AnswerDeepDive[];
@@ -117,19 +134,6 @@ interface QuestionCandidate {
   contextWindow: string;
   detectedAt: number;
   understanding: CodingQuestionUnderstanding;
-}
-
-interface ParsedAnswerPayload {
-  answer: string;
-  followUps: string[];
-  understanding: CodingQuestionUnderstanding;
-  quality: {
-    clarity: number;
-    correctness: number;
-    concision: number;
-    relevance: number;
-    overall: number;
-  };
 }
 
 interface SttStatusPayload {
@@ -248,6 +252,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const [isScreenAnswering, setIsScreenAnswering] = useState(false);
   const [sttStatus, setSttStatus] = useState<SttStatusPayload | null>(null);
   const [isEndingMeeting, setIsEndingMeeting] = useState(false);
+  const [isMicEnabled, setIsMicEnabled] = useState(true);
   const [resourceScopeSelection, setResourceScopeSelection] = useState<ResourceScopeSelection>(() =>
     loadResourceScopeSelection()
   );
@@ -291,6 +296,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const cloudOffloadAttemptedRef = useRef(false);
   const lastHandledEndRequestRef = useRef(0);
   const vectorLookupWarningShownRef = useRef(false);
+  const questionClassificationInFlightRef = useRef(false);
   const puterScriptPromiseRef = useRef<Promise<void> | null>(null);
   const puterReadyRef = useRef(false);
 
@@ -299,6 +305,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const interviewerStreamRef = useRef<MediaStream | null>(null);
   const audioPipelinesRef = useRef<AudioPipelineNodes[]>([]);
   const meetingStateRef = useRef({ isRecording: false, isPaused: false });
+  const micEnabledRef = useRef(true);
   const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
@@ -331,9 +338,9 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
 
   const getConfiguredSttProviderChain = (provider: MeetingSttProviderChoice): string[] => {
     if (provider === "auto") return [];
-    if (provider === "puter") return ["puter", "groq", "elevenlabs"];
-    if (provider === "groq") return ["groq", "puter", "elevenlabs"];
-    if (provider === "google") return ["google", "elevenlabs", "puter", "groq"];
+    if (provider === "puter") return ["puter", "groq"];
+    if (provider === "groq") return ["groq", "puter"];
+    if (provider === "google") return ["google", "puter", "groq", "elevenlabs"];
     return ["elevenlabs", "puter", "groq"];
   };
 
@@ -562,60 +569,6 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     syncMeetingAnalytics(false).catch(() => undefined);
   };
 
-  const stopWords = useRef(
-    new Set([
-      "the",
-      "a",
-      "an",
-      "and",
-      "or",
-      "to",
-      "for",
-      "of",
-      "in",
-      "on",
-      "with",
-      "is",
-      "are",
-      "was",
-      "were",
-      "be",
-      "been",
-      "being",
-      "do",
-      "does",
-      "did",
-      "can",
-      "could",
-      "would",
-      "should",
-      "what",
-      "why",
-      "how",
-      "tell",
-      "about",
-      "me",
-      "you",
-      "we",
-      "our",
-      "your",
-      "my",
-      "i",
-      "it",
-      "this",
-      "that",
-      "these",
-      "those",
-      "as",
-      "at",
-      "from",
-      "by",
-      "have",
-      "has",
-      "had",
-    ])
-  );
-
   useEffect(() => {
     const controls = getControlsForCpuMode(cpuMode);
     setChunkRateMs(controls.chunkRateMs);
@@ -638,183 +591,6 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     }));
   }, [cpuMode, chunkRateMs, maxChunkQueue, answerThrottleMs, modelThrottleMs, cloudOffload]);
 
-  const tokenize = (text: string) =>
-    (text.toLowerCase().match(/[a-z0-9]+/g) || []).filter(
-      (token) => token.length > 2 && !stopWords.current.has(token)
-    );
-
-  const normalizeQuestionSignature = (text: string) =>
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  const questionStarterRegex =
-    /^(what|why|how|when|where|who|which|can you|could you|would you|will you|tell me|walk me through|describe|explain|give me|do you|are you|have you|did you)\b/i;
-  const questionCueAnywhereRegex =
-    /\b(what|why|how|when|where|who|which|can you|could you|would you|will you|tell me|walk me through|describe|explain|give me|do you|are you|have you|did you)\b/i;
-  const questionSignalRegex =
-    /\b(explain|describe|walk me through|tell me|give me|compare|difference|trade-?off|approach|design|implement|optimi[sz]e|debug|why|how|what)\b/i;
-  const technicalSignalRegex =
-    /\b(array|string|graph|tree|heap|stack|queue|hash|map|set|dp|dynamic programming|greedy|binary search|two pointer|sliding window|sort|time complexity|space complexity|big o|edge case|constraints?|algorithm|data structure|api|database|schema|query|endpoint|auth|token|latency|throughput|memory|cpu|index|pipeline)\b/i;
-  const transformSignalRegex =
-    /\b(convert|conversion|transform|map|parse|serialize|deserialize|normalize|format|cast|truncate|migrate)\b/i;
-  const identifierSignalRegex = /\b(id|identifier|uuid|primary key|foreign key)\b/i;
-  const numericTransformSignalRegex =
-    /\b(from|to|into|between|vs|versus)\b.*\b\d+\b|\b\d+\b.*\b(from|to|into|between|vs|versus)\b/i;
-  const problemStatementRegex =
-    /\b(you are given|given an? (integer|array|string|graph|tree)|group size|return (true|false)|consecutive|divide the array|can be divided|output|find|determine)\b/i;
-  const followUpRegex = /^(and|also|then|what about|how about|plus|one more|another)\b/i;
-  const nonQuestionFillerRegex = /^(ok|okay|right|sure|thanks|great|cool|nice|yep|yeah|hmm|uh|um)\b/i;
-  const confirmationTailRegex = /\b(right|all right|ok|okay|correct)\?*$/i;
-  const constraintSignalRegex =
-    /\b(at most|at least|exactly|less than|greater than|no more than|must|cannot|without|in place|in-place|o\([^)]+\)|time complexity|space complexity|n\s*[<>=]{1,2}\s*\d+|k\s*[<>=]{1,2}\s*\d+)\b/gi;
-  const edgeCaseSignalRegex =
-    /\b(empty|null|undefined|single|one element|duplicate|negative|zero|overflow|underflow|sorted|reverse sorted|all same|all equal|large input)\b/gi;
-
-  const extractQuestionUnderstanding = (
-    question: string,
-    contextWindow: string
-  ): CodingQuestionUnderstanding => {
-    const normalizedQuestion = question.replace(/\s+/g, " ").trim();
-    const sourceText = `${contextWindow}\n${normalizedQuestion}`.toLowerCase();
-
-    const constraints = Array.from(
-      new Set((sourceText.match(constraintSignalRegex) || []).map(item => item.trim()))
-    ).slice(0, 6);
-
-    const edgeCases = Array.from(
-      new Set((sourceText.match(edgeCaseSignalRegex) || []).map(item => item.trim()))
-    ).slice(0, 6);
-
-    const problemStatement = normalizedQuestion
-      .replace(/^(can you|could you|would you|please|hey|ok|okay)\s+/i, "")
-      .replace(/\?+$/, "")
-      .trim();
-
-    const defaultEdgeCases =
-      edgeCases.length > 0
-        ? edgeCases
-        : [
-            "empty input",
-            "single element",
-            "duplicates",
-            "maximum constraint boundary"
-          ];
-
-    return {
-      problemStatement: problemStatement || normalizedQuestion,
-      constraints,
-      edgeCases: defaultEdgeCases
-    };
-  };
-
-  const splitTranscriptIntoCandidates = (text: string): string[] => {
-    const normalized = text.replace(/\s+/g, " ").trim();
-    if (!normalized) return [];
-    const sentences = normalized
-      .split(/(?<=[?.!])\s+/)
-      .map((item) => item.trim())
-      .filter(Boolean);
-    const cueRegex = new RegExp(questionCueAnywhereRegex.source, "gi");
-    const cueSegments = Array.from(normalized.matchAll(cueRegex))
-      .map((match) => {
-        if (typeof match.index !== "number") return "";
-        return normalized
-          .slice(match.index)
-          .replace(/^(so|then|and|also)\s+/i, "")
-          .trim();
-      })
-      .filter((item) => item.length >= 14)
-      .slice(-4);
-
-    const all = [...sentences, ...cueSegments];
-    const unique = Array.from(new Set(all.map((item) => normalizeQuestionSignature(item))));
-    return unique.length > 0 ? unique : [normalized];
-  };
-
-  const scoreQuestionConfidence = (text: string): number => {
-    const normalized = text.replace(/\s+/g, " ").trim();
-    if (!normalized) return 0;
-
-    const words = normalized.split(" ").filter(Boolean);
-    const hasQuestionMark = normalized.endsWith("?");
-    const hasStarter = questionStarterRegex.test(normalized);
-    const hasEmbeddedCue = !hasStarter && questionCueAnywhereRegex.test(normalized);
-    const hasQuestionSignal = questionSignalRegex.test(normalized);
-    const hasTechnicalSignal = technicalSignalRegex.test(normalized);
-    const hasTransformSignal = transformSignalRegex.test(normalized);
-    const hasIdentifierSignal = identifierSignalRegex.test(normalized);
-    const hasNumericTransformSignal = numericTransformSignalRegex.test(normalized);
-    const hasSignal =
-      hasQuestionSignal ||
-      hasTechnicalSignal ||
-      hasTransformSignal ||
-      (hasIdentifierSignal && hasNumericTransformSignal);
-    const hasProblemStatement = problemStatementRegex.test(normalized);
-    const hasConfirmationTail = confirmationTailRegex.test(normalized);
-    let score = 0;
-
-    if (hasQuestionMark) score += 0.45;
-    if (hasStarter) score += 0.32;
-    if (hasEmbeddedCue) score += 0.24;
-    if (hasQuestionSignal) score += 0.18;
-    if (hasTechnicalSignal) score += 0.15;
-    if (hasTransformSignal) score += 0.12;
-    if (hasIdentifierSignal) score += 0.08;
-    if (hasNumericTransformSignal) score += 0.1;
-    if (hasProblemStatement) score += 0.32;
-    if (followUpRegex.test(normalized)) score += 0.12;
-    if (words.length >= 7 && words.length <= 30) score += 0.1;
-    if (words.length > 45) score -= 0.05;
-    if (words.length < 6) score -= 0.25;
-    if (nonQuestionFillerRegex.test(normalized) && words.length <= 5) score -= 0.4;
-    if (hasConfirmationTail) score -= 0.45;
-    if (!hasStarter && !hasSignal && !hasQuestionMark && !hasProblemStatement) score -= 0.25;
-
-    return Math.max(0, Math.min(1, score));
-  };
-
-  const getQuestionDetectionThreshold = (question: string): number => {
-    const normalized = question.replace(/\s+/g, " ").trim();
-    const hasStarter = questionStarterRegex.test(normalized);
-    const hasSignal =
-      questionSignalRegex.test(normalized) ||
-      technicalSignalRegex.test(normalized) ||
-      transformSignalRegex.test(normalized) ||
-      (identifierSignalRegex.test(normalized) && numericTransformSignalRegex.test(normalized));
-    const hasQuestionMark = normalized.endsWith("?");
-    const hasProblemStatement = problemStatementRegex.test(normalized);
-
-    if (hasProblemStatement) return 0.42;
-    if (hasQuestionMark && (hasStarter || hasSignal)) return 0.46;
-    if (hasStarter && hasSignal) return 0.48;
-    if (hasStarter) return 0.5;
-    if (hasSignal) return 0.54;
-    return 0.62;
-  };
-
-  const isLikelyInterviewQuestion = (question: string, confidence: number): boolean => {
-    const normalized = question.replace(/\s+/g, " ").trim();
-    const words = normalized.split(" ").filter(Boolean);
-    const hasStarter = questionStarterRegex.test(normalized);
-    const hasSignal =
-      questionSignalRegex.test(normalized) ||
-      technicalSignalRegex.test(normalized) ||
-      transformSignalRegex.test(normalized) ||
-      (identifierSignalRegex.test(normalized) && numericTransformSignalRegex.test(normalized));
-    const hasQuestionMark = normalized.endsWith("?");
-    const hasProblemStatement = problemStatementRegex.test(normalized);
-    const confirmationOnly = confirmationTailRegex.test(normalized) && words.length <= 12;
-
-    if (confirmationOnly && !hasStarter) return false;
-    if (!hasStarter && !hasSignal && !hasQuestionMark && !hasProblemStatement) return false;
-    if (words.length < 5 && !hasStarter && !hasQuestionMark) return false;
-    if (confidence < getQuestionDetectionThreshold(normalized)) return false;
-    return true;
-  };
-
   const buildConversationContext = (maxTurns = 6): string => {
     const recentTurns = transcriptHistoryRef.current.slice(-maxTurns);
     return recentTurns
@@ -822,64 +598,9 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       .join("\n");
   };
 
-  const buildQuestionCandidate = (
-    text: string,
-    source: MeetingAudioSource,
-    contextWindowOverride?: string
-  ): QuestionCandidate | null => {
-    const segments = splitTranscriptIntoCandidates(text);
-    if (segments.length === 0) return null;
-
-    let bestQuestion = "";
-    let bestScore = 0;
-    segments.forEach((segment, index) => {
-      // Prefer later segments in a chunk, they more often contain the actual ask.
-      const positionBoost = (index + 1) / Math.max(segments.length, 1) * 0.03;
-      const score = Math.min(1, scoreQuestionConfidence(segment) + positionBoost);
-      if (score > bestScore) {
-        bestScore = score;
-        bestQuestion = segment;
-      }
-    });
-
-    if (!bestQuestion) return null;
-    if (!isLikelyInterviewQuestion(bestQuestion, bestScore)) return null;
-    const contextWindow = contextWindowOverride || buildConversationContext();
-    return {
-      id: `question-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-      question: bestQuestion,
-      source,
-      confidence: bestScore,
-      contextWindow,
-      detectedAt: Date.now(),
-      understanding: extractQuestionUnderstanding(bestQuestion, contextWindow),
-    };
-  };
-
   const truncate = (text: string, limit: number) => {
     if (text.length <= limit) return text;
     return `${text.slice(0, limit)}...`;
-  };
-
-  const scoreResource = (item: ResourceItem, tokens: string[]) => {
-    const haystack = `${item.title} ${item.content} ${item.url || ""}`.toLowerCase();
-    const title = item.title.toLowerCase();
-    return tokens.reduce((score, token) => {
-      if (haystack.includes(token)) {
-        return score + (title.includes(token) ? 2 : 1);
-      }
-      return score;
-    }, 0);
-  };
-
-  const selectRelevant = (items: ResourceItem[], tokens: string[], limit: number) => {
-    if (items.length === 0) return [];
-    const scored = items
-      .map((item) => ({ item, score: scoreResource(item, tokens) }))
-      .sort((a, b) => b.score - a.score);
-    const filtered = scored.filter((entry) => entry.score > 0).slice(0, limit).map((entry) => entry.item);
-    if (filtered.length > 0) return filtered;
-    return scored.slice(0, limit).map((entry) => entry.item);
   };
 
   const buildResourceContext = async (question: string) => {
@@ -887,188 +608,36 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     if (!user) return { context: "", sources: [] as string[] };
     const resources = loadResources(user.id);
     const selectedFolders = new Set(getSelectedVectorFolders());
-    const selectedJdIds = getEffectiveSelectedJdIds(resources);
-    const selectedResourceFolderIds = getEffectiveSelectedResourceFolderIds(resources);
     if (selectedFolders.size === 0) {
       return { context: "", sources: [] as string[] };
     }
 
-    const sections: string[] = [];
-    const sources: string[] = [];
-    const maxLength = 4000;
-
-    try {
-      const vectorMatches = await queryWorkspaceVectors(user.id, question, 7);
-      const scopedMatches = vectorMatches.filter((item) => {
-        if (!selectedFolders.has(item.metadata.folder)) return false;
-        if (item.metadata.folder === "jd") {
-          return selectedJdIds.has(item.metadata.resourceId);
+    const selectedJdIds = getEffectiveSelectedJdIds(resources);
+    const selectedResourceFolderIds = getEffectiveSelectedResourceFolderIds(resources);
+    const result = await buildHybridResourceContext({
+      userId: user.id,
+      question,
+      resources,
+      includeResume: selectedFolders.has("resume"),
+      includeJd: selectedFolders.has("jd"),
+      includeResources: selectedFolders.has("resource"),
+      selectedJdIds,
+      selectedResourceFolderIds,
+      maxContextLength: 4000,
+      vectorTopK: 8,
+      finalTopK: 7,
+      onWarning: message => {
+        if (!vectorLookupWarningShownRef.current) {
+          vectorLookupWarningShownRef.current = true;
+          addLog("warning", `⚠️ ${message}`);
         }
-        if (item.metadata.folder === "resource") {
-          if (selectedResourceFolderIds.size === 0) return false;
-          if (item.metadata.resourceFolderId) {
-            return selectedResourceFolderIds.has(item.metadata.resourceFolderId);
-          }
-          // Backward compatibility for vectors created before folder metadata.
-          return resourceScopeSelection.resources;
-        }
-        return true;
-      });
-      if (scopedMatches.length > 0) {
-        scopedMatches.forEach((item) => {
-          const label =
-            item.metadata.folder === "jd"
-              ? "INTERVIEW JD"
-              : item.metadata.folder === "resume"
-              ? "RESUME"
-              : `RESOURCE${
-                  item.metadata.resourceFolderName
-                    ? ` (${item.metadata.resourceFolderName}${
-                        item.metadata.resourceFolderType
-                          ? ` - ${RESOURCE_FOLDER_TYPE_LABELS[item.metadata.resourceFolderType]}`
-                          : ""
-                      })`
-                    : ""
-                }`;
-          sections.push(`${label}: ${item.metadata.title}\n${truncate(item.data.trim(), 800)}`);
-          if (item.metadata.title) {
-            sources.push(item.metadata.title);
-          }
-        });
-
-        const combined = sections.join("\n\n");
-        return {
-          context: combined.length > maxLength ? `${combined.slice(0, maxLength)}...` : combined,
-          sources
-        };
       }
-    } catch (error: any) {
-      if (!vectorLookupWarningShownRef.current) {
-        vectorLookupWarningShownRef.current = true;
-        addLog("warning", `⚠️ Vector lookup failed, using local resources: ${error?.message || "unknown"}`);
-      }
-    }
+    });
 
-    const tokens = tokenize(question);
-
-    if (resourceScopeSelection.resume && resources.resume.trim()) {
-      sections.push(`RESUME\n${truncate(resources.resume.trim(), 1200)}`);
-      sources.push("Resume");
-    }
-
-    if (resourceScopeSelection.jd) {
-      const selectedDocs = resources.documents.filter((item) => selectedJdIds.has(item.id));
-      const docSelections = selectRelevant(selectedDocs, tokens, 3);
-      docSelections.forEach((item) => {
-        sections.push(`DOCUMENT: ${item.title}\n${truncate(item.content.trim(), 800)}`);
-        sources.push(item.title);
-      });
-    }
-
-    if (resourceScopeSelection.resources) {
-      const scopedKnowledge = resources.knowledge.filter((item) =>
-        selectedResourceFolderIds.has(item.folderId || DEFAULT_KNOWLEDGE_FOLDER_ID)
-      );
-      const knowledgeSelections = selectRelevant(scopedKnowledge, tokens, 3);
-      knowledgeSelections.forEach((item) => {
-        const folderName =
-          resources.knowledgeFolders.find((folder) => folder.id === (item.folderId || ""))?.name ||
-          "General Resources";
-        const folderType =
-          resources.knowledgeFolders.find((folder) => folder.id === (item.folderId || ""))?.type || "other";
-        sections.push(
-          `KNOWLEDGE (${folderName} - ${RESOURCE_FOLDER_TYPE_LABELS[folderType]}): ${item.title}\n${truncate(
-            item.content.trim(),
-            800
-          )}`
-        );
-        sources.push(item.title);
-      });
-    }
-
-    const combined = sections.join("\n\n");
     return {
-      context: combined.length > maxLength ? `${combined.slice(0, maxLength)}...` : combined,
-      sources,
+      context: result.context,
+      sources: result.sources
     };
-  };
-
-  const parseAnswerPayload = (
-    raw: string,
-    fallbackCandidate: QuestionCandidate
-  ): ParsedAnswerPayload => {
-    const fallback: ParsedAnswerPayload = {
-      answer: cleanLLMResponse(raw),
-      followUps: [],
-      understanding: fallbackCandidate.understanding,
-      quality: {
-        clarity: clamp01(fallbackCandidate.confidence),
-        correctness: clamp01(fallbackCandidate.confidence),
-        concision: 0.75,
-        relevance: clamp01(fallbackCandidate.confidence),
-        overall: clamp01((fallbackCandidate.confidence + 0.75 + fallbackCandidate.confidence) / 3)
-      }
-    };
-
-    const sanitized = cleanLLMResponse(raw)
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/```$/i, "")
-      .trim();
-
-    try {
-      const parsed = JSON.parse(sanitized) as Record<string, any>;
-      const answer =
-        typeof parsed?.answer === "string" && parsed.answer.trim()
-          ? parsed.answer.trim()
-          : fallback.answer;
-      const followUps = Array.isArray(parsed?.follow_ups)
-        ? parsed.follow_ups.filter((item: unknown) => typeof item === "string").map((item: string) => item.trim()).filter(Boolean).slice(0, 4)
-        : [];
-      const understanding = parsed?.question_understanding
-        ? {
-            problemStatement:
-              typeof parsed.question_understanding.problem_statement === "string"
-                ? parsed.question_understanding.problem_statement.trim()
-                : fallbackCandidate.understanding.problemStatement,
-            constraints: Array.isArray(parsed.question_understanding.constraints)
-              ? parsed.question_understanding.constraints
-                  .filter((item: unknown) => typeof item === "string")
-                  .map((item: string) => item.trim())
-                  .filter(Boolean)
-                  .slice(0, 8)
-              : fallbackCandidate.understanding.constraints,
-            edgeCases: Array.isArray(parsed.question_understanding.edge_cases)
-              ? parsed.question_understanding.edge_cases
-                  .filter((item: unknown) => typeof item === "string")
-                  .map((item: string) => item.trim())
-                  .filter(Boolean)
-                  .slice(0, 8)
-              : fallbackCandidate.understanding.edgeCases
-          }
-        : fallbackCandidate.understanding;
-
-      const quality = {
-        clarity: clamp01(Number(parsed?.quality?.clarity ?? fallback.quality.clarity)),
-        correctness: clamp01(Number(parsed?.quality?.correctness ?? fallback.quality.correctness)),
-        concision: clamp01(Number(parsed?.quality?.concision ?? fallback.quality.concision)),
-        relevance: clamp01(Number(parsed?.quality?.relevance ?? fallback.quality.relevance)),
-        overall: clamp01(
-          Number(
-            parsed?.quality?.overall ??
-              (fallback.quality.clarity +
-                fallback.quality.correctness +
-                fallback.quality.concision +
-                fallback.quality.relevance) /
-                4
-          )
-        )
-      };
-
-      return { answer, followUps, understanding, quality };
-    } catch {
-      return fallback;
-    }
   };
 
   const coerceLlmResponseText = (payload: unknown): string => {
@@ -1169,114 +738,182 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       questionId: candidate.id,
       question: trimmed,
       status: "pending",
+      stage: "draft",
+      isRefining: true,
       createdAt: Date.now(),
       confidence: Math.round(candidate.confidence * 100),
       understanding: candidate.understanding
     };
     setAnswers((prev) => [pendingAnswer, ...prev].slice(0, 24));
 
-    const { context } = await buildResourceContext(trimmed);
-    const user = getCurrentUser();
-    const selectedFolderLabels = getSelectedFolderLabels();
-    const prompt = `You are an interview copilot for coding interviews.
-
-Candidate: ${user?.name || "Candidate"}
-Question source: ${candidate.source === "interviewer" ? "Interviewer" : "User"}
-Selected resource folders: ${selectedFolderLabels.join(", ") || "None"}
-
-Recent conversation context:
-${candidate.contextWindow || "No recent context."}
-
-Detected question confidence: ${Math.round(candidate.confidence * 100)}%
-Detected question: "${trimmed}"
-
-Candidate resources:
-${context || "No resources provided."}
-
-Extracted coding intent:
-- Problem statement: ${candidate.understanding.problemStatement}
-- Constraints: ${candidate.understanding.constraints.join("; ") || "none detected"}
-- Edge cases: ${candidate.understanding.edgeCases.join("; ") || "none detected"}
-
-Return STRICT JSON only (no markdown):
-{
-  "answer": "one concise interview-ready response under 140 words",
-  "follow_ups": ["optional short bullet 1", "optional short bullet 2"],
-  "question_understanding": {
-    "problem_statement": "normalized coding prompt",
-    "constraints": ["constraint 1", "constraint 2"],
-    "edge_cases": ["edge case 1", "edge case 2"]
-  },
-  "quality": {
-    "clarity": 0.0,
-    "correctness": 0.0,
-    "concision": 0.0,
-    "relevance": 0.0,
-    "overall": 0.0
-  }
-}
-
-Rules:
-- Be direct and spoken-language friendly.
-- If coding: include approach, core data structure, complexity, and one edge case.
-- Keep follow_ups optional (0-2 bullets max).`;
+    const upsertAnswerAnalytics = (entry: AnswerAnalytics) => {
+      updateAnalyticsRef((current) => {
+        const next = [entry, ...(current.answers || []).filter((item) => item.id !== entry.id)].slice(0, 80);
+        return {
+          ...current,
+          answers: next
+        };
+      });
+    };
 
     try {
+      const { context } = await buildResourceContext(trimmed);
+      const user = getCurrentUser();
+      const selectedFolderLabels = getSelectedFolderLabels();
+
       await maybeUseCloudOffload();
       await applyModelThrottle();
 
-      const startedAt = Date.now();
-      const [response, config] = await Promise.all([
-        window.electronAPI.invoke("llm-chat", prompt),
-        window.electronAPI.getCurrentLlmConfig().catch(() => ({
-          provider: "groq" as const,
-          model: "unknown",
-          isOllama: false
-        }))
-      ]);
-      const latencyMs = Date.now() - startedAt;
-      const parsed = parseAnswerPayload(response, candidate);
-      const cleaned = cleanLLMResponse(parsed.answer);
-      const qualityOverall = clamp01(parsed.quality.overall);
+      const draftStartedAt = Date.now();
+      const parsedDraft = await generateFastDraftAnswer({
+        candidate,
+        candidateName: user?.name || "Candidate",
+        selectedFolderLabels,
+        resourceContext: context,
+        invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+      });
+      const draftLatencyMs = Date.now() - draftStartedAt;
+      const draftAnswer = cleanLLMResponse(parsedDraft.answer);
 
-      const answerAnalytics: AnswerAnalytics = {
-        id: answerId,
-        questionId: candidate.id,
-        question: trimmed,
-        answer: cleaned,
-        followUps: parsed.followUps,
-        provider: config.provider,
-        model: config.model,
-        createdAt: Date.now(),
-        latencyMs,
-        quality: parsed.quality
-      };
-      updateAnalyticsRef((current) => ({
-        ...current,
-        answers: [answerAnalytics, ...(current.answers || [])].slice(0, 80)
+      await applyModelThrottle();
+      const draftJudge = await judgeAnswerQuality({
+        candidate: {
+          ...candidate,
+          understanding: parsedDraft.understanding
+        },
+        answer: draftAnswer,
+        invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+      });
+
+      const config = await window.electronAPI.getCurrentLlmConfig().catch(() => ({
+        provider: "groq" as const,
+        model: "unknown",
+        isOllama: false
       }));
 
+      const draftQualityOverall = clamp01(draftJudge.quality.overall);
       setAnswers((prev) =>
         prev.map((item) =>
           item.id === answerId
             ? {
                 ...item,
-                response: cleaned,
+                response: draftAnswer,
                 status: "ready",
-                followUps: parsed.followUps,
-                understanding: parsed.understanding,
-                qualityOverall,
-                latencyMs,
+                stage: "draft",
+                isRefining: true,
+                followUps: parsedDraft.followUps,
+                understanding: parsedDraft.understanding,
+                qualityOverall: draftQualityOverall,
+                qualityNotes: draftJudge.notes,
+                latencyMs: draftLatencyMs,
+                draftLatencyMs,
                 provider: config.provider,
                 model: config.model
               }
             : item
         )
       );
+
+      upsertAnswerAnalytics({
+        id: answerId,
+        questionId: candidate.id,
+        question: trimmed,
+        answer: draftAnswer,
+        followUps: parsedDraft.followUps,
+        provider: config.provider,
+        model: config.model,
+        createdAt: Date.now(),
+        latencyMs: draftLatencyMs,
+        draftLatencyMs,
+        generationStage: "draft",
+        qualityJudgeProvider: config.provider,
+        qualityJudgeModel: config.model,
+        quality: draftJudge.quality
+      });
+
+      (async () => {
+        try {
+          await applyModelThrottle();
+          const refineStartedAt = Date.now();
+          const refinedAnswer = await generateRefinedAnswer({
+            candidate: {
+              ...candidate,
+              understanding: parsedDraft.understanding
+            },
+            draftAnswer,
+            suggestion: "Add concise detail for follow-up depth while staying interview-ready.",
+            resourceContext: context,
+            invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+          });
+          const refineLatencyMs = Date.now() - refineStartedAt;
+
+          await applyModelThrottle();
+          const refinedJudge = await judgeAnswerQuality({
+            candidate: {
+              ...candidate,
+              understanding: parsedDraft.understanding
+            },
+            answer: refinedAnswer,
+            invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+          });
+          const refinedOverall = clamp01(refinedJudge.quality.overall);
+
+          setAnswers((prev) =>
+            prev.map((item) =>
+              item.id === answerId
+                ? {
+                    ...item,
+                    response: refinedAnswer,
+                    stage: "refined",
+                    isRefining: false,
+                    qualityOverall: refinedOverall,
+                    qualityNotes: refinedJudge.notes || item.qualityNotes,
+                    refineLatencyMs,
+                    latencyMs: (item.draftLatencyMs || 0) + refineLatencyMs
+                  }
+                : item
+            )
+          );
+
+          upsertAnswerAnalytics({
+            id: answerId,
+            questionId: candidate.id,
+            question: trimmed,
+            answer: refinedAnswer,
+            followUps: parsedDraft.followUps,
+            provider: config.provider,
+            model: config.model,
+            createdAt: Date.now(),
+            latencyMs: draftLatencyMs + refineLatencyMs,
+            draftLatencyMs,
+            refineLatencyMs,
+            generationStage: "refined",
+            qualityJudgeProvider: config.provider,
+            qualityJudgeModel: config.model,
+            quality: refinedJudge.quality
+          });
+        } catch (refineError: any) {
+          const message = refineError?.message || "Refinement failed";
+          setAnswers((prev) =>
+            prev.map((item) =>
+              item.id === answerId
+                ? {
+                    ...item,
+                    isRefining: false,
+                    qualityNotes: item.qualityNotes || message
+                  }
+                : item
+            )
+          );
+          addLog("warning", `⚠️ Refinement skipped: ${message}`);
+        }
+      })().catch(() => undefined);
     } catch (err: any) {
       setAnswers((prev) =>
         prev.map((item) =>
-          item.id === answerId ? { ...item, status: "error", error: err?.message || "Failed to generate answer." } : item
+          item.id === answerId
+            ? { ...item, status: "error", isRefining: false, error: err?.message || "Failed to generate answer." }
+            : item
         )
       );
     } finally {
@@ -1387,7 +1024,7 @@ If coding-related, include quick complexity and one edge case.`;
       confidence: 0.92,
       contextWindow,
       detectedAt: Date.now(),
-      understanding: extractQuestionUnderstanding(screenQuestion, contextWindow)
+      understanding: buildQuestionUnderstanding(screenQuestion, contextWindow)
     };
 
     const answerId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1468,8 +1105,18 @@ Return STRICT JSON only (no markdown):
         }))
       ]);
       const latencyMs = Date.now() - startedAt;
-      const parsed = parseAnswerPayload(coerceLlmResponseText(response), fallbackCandidate);
+      const parsed = parseAnswerEnvelope(coerceLlmResponseText(response), fallbackCandidate);
       const cleaned = cleanLLMResponse(parsed.answer);
+      await applyModelThrottle();
+      const judged = await judgeAnswerQuality({
+        candidate: {
+          ...fallbackCandidate,
+          understanding: parsed.understanding
+        },
+        answer: cleaned,
+        invokeLlm: (judgePrompt) => window.electronAPI.invoke("llm-chat", judgePrompt)
+      });
+      const judgedOverall = clamp01(judged.quality.overall);
 
       const answerAnalytics: AnswerAnalytics = {
         id: answerId,
@@ -1481,7 +1128,9 @@ Return STRICT JSON only (no markdown):
         model: config.model,
         createdAt: Date.now(),
         latencyMs,
-        quality: parsed.quality
+        qualityJudgeProvider: config.provider,
+        qualityJudgeModel: config.model,
+        quality: judged.quality
       };
       updateAnalyticsRef((current) => ({
         ...current,
@@ -1497,7 +1146,8 @@ Return STRICT JSON only (no markdown):
                 response: cleaned,
                 followUps: parsed.followUps,
                 understanding: parsed.understanding,
-                qualityOverall: clamp01(parsed.quality.overall),
+                qualityOverall: judgedOverall,
+                qualityNotes: judged.notes,
                 latencyMs,
                 provider: config.provider,
                 model: config.model
@@ -1529,69 +1179,113 @@ Return STRICT JSON only (no markdown):
     };
   };
 
-  const flushDetectedQuestion = () => {
+  const flushDetectedQuestion = async () => {
+    if (questionClassificationInFlightRef.current) return;
     const pending = pendingDetectionRef.current;
     pendingDetectionRef.current = null;
     if (!pending) return;
+    questionClassificationInFlightRef.current = true;
 
-    const threshold = getQuestionDetectionThreshold(pending.question);
-    if (pending.confidence < threshold) {
+    try {
+      let classifiedCandidate = pending;
+      try {
+        await maybeUseCloudOffload();
+        await applyModelThrottle();
+        const modelClassification = await classifyQuestionIntentWithModel(
+          pending,
+          (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+        );
+
+        if (!modelClassification.isQuestion) {
+          addLog("info", `🧠 Ignored non-question: ${truncate(pending.question, 80)}`);
+          return;
+        }
+
+        classifiedCandidate = {
+          ...pending,
+          question: modelClassification.normalizedQuestion || pending.question,
+          confidence: Math.max(pending.confidence, modelClassification.confidence),
+          understanding: modelClassification.understanding,
+          detectedAt: Date.now()
+        };
+      } catch (classificationError: any) {
+        addLog(
+          "warning",
+          `⚠️ Model classifier unavailable, using heuristic detection (${classificationError?.message || "unknown"}).`
+        );
+      }
+
+      const threshold = getQuestionDetectionThreshold(classifiedCandidate.question);
+      if (classifiedCandidate.confidence < threshold) {
+        addLog(
+          "info",
+          `🧠 Ignored low-confidence question (${Math.round(classifiedCandidate.confidence * 100)}% < ${Math.round(
+            threshold * 100
+          )}%): ${truncate(
+            classifiedCandidate.question,
+            80
+          )}`
+        );
+        return;
+      }
+
+      const signature = normalizeQuestionSignature(classifiedCandidate.question);
+      const now = Date.now();
+      const cooldownMs = Math.max(answerThrottleMs, 3000);
+      if (
+        signature &&
+        signature === lastQuestionSignatureRef.current &&
+        now - lastQuestionTimestampRef.current < cooldownMs
+      ) {
+        return;
+      }
+
+      lastQuestionSignatureRef.current = signature;
+      lastQuestionTimestampRef.current = now;
       addLog(
         "info",
-        `🧠 Ignored low-confidence question (${Math.round(pending.confidence * 100)}% < ${Math.round(
-          threshold * 100
-        )}%): ${truncate(
-          pending.question,
+        `🧠 Question detected (${Math.round(classifiedCandidate.confidence * 100)}%): ${truncate(
+          classifiedCandidate.question,
           80
         )}`
       );
-      return;
+
+      const detectedQuestion: DetectedQuestionAnalytics = {
+        id: classifiedCandidate.id,
+        question: classifiedCandidate.question,
+        source: classifiedCandidate.source,
+        confidence: clamp01(classifiedCandidate.confidence),
+        detectedAt: classifiedCandidate.detectedAt,
+        contextWindow: classifiedCandidate.contextWindow,
+        understanding: classifiedCandidate.understanding
+      };
+      updateAnalyticsRef((current) => ({
+        ...current,
+        detectedQuestions: [detectedQuestion, ...(current.detectedQuestions || [])].slice(0, 80)
+      }));
+
+      generateAnswer(classifiedCandidate);
+    } finally {
+      questionClassificationInFlightRef.current = false;
     }
-
-    const signature = normalizeQuestionSignature(pending.question);
-    const now = Date.now();
-    const cooldownMs = Math.max(answerThrottleMs, 3000);
-    if (
-      signature &&
-      signature === lastQuestionSignatureRef.current &&
-      now - lastQuestionTimestampRef.current < cooldownMs
-    ) {
-      return;
-    }
-
-    lastQuestionSignatureRef.current = signature;
-    lastQuestionTimestampRef.current = now;
-    addLog("info", `🧠 Question detected (${Math.round(pending.confidence * 100)}%): ${truncate(pending.question, 80)}`);
-
-    const detectedQuestion: DetectedQuestionAnalytics = {
-      id: pending.id,
-      question: pending.question,
-      source: pending.source,
-      confidence: clamp01(pending.confidence),
-      detectedAt: pending.detectedAt,
-      contextWindow: pending.contextWindow,
-      understanding: pending.understanding
-    };
-    updateAnalyticsRef((current) => ({
-      ...current,
-      detectedQuestions: [detectedQuestion, ...(current.detectedQuestions || [])].slice(0, 80)
-    }));
-
-    generateAnswer(pending);
   };
 
   const handleTranscriptForAnswer = (payload: LiveTranscriptPayload) => {
     const shouldProcess = hasInterviewerAudioRef.current ? payload.source === "interviewer" : payload.source === "user";
     if (!shouldProcess) return;
 
-    const candidateFromPayload = buildQuestionCandidate(payload.text, payload.source);
+    const candidateFromPayload = buildHeuristicQuestionCandidate(
+      payload.text,
+      payload.source,
+      buildConversationContext(6)
+    );
     const recentMergedText = transcriptHistoryRef.current
       .slice(-4)
       .map((entry) => entry.text)
       .join(" ")
       .trim();
     const candidateFromRecent = recentMergedText
-      ? buildQuestionCandidate(recentMergedText, payload.source, buildConversationContext(8))
+      ? buildHeuristicQuestionCandidate(recentMergedText, payload.source, buildConversationContext(8))
       : null;
     const candidate =
       !candidateFromPayload
@@ -1611,7 +1305,7 @@ Return STRICT JSON only (no markdown):
     ) {
       const mergedQuestion = `${existing.question} ${candidate.question}`.replace(/\s+/g, " ").trim();
       const mergedContext = buildConversationContext(8);
-      const mergedCandidate = buildQuestionCandidate(
+      const mergedCandidate = buildHeuristicQuestionCandidate(
         mergedQuestion,
         candidate.source,
         mergedContext
@@ -1632,7 +1326,9 @@ Return STRICT JSON only (no markdown):
       clearTimeout(questionDebounceRef.current);
     }
     questionDebounceRef.current = setTimeout(() => {
-      flushDetectedQuestion();
+      flushDetectedQuestion().catch((error: any) => {
+        addLog("warning", `⚠️ Question detection flush failed: ${error?.message || "unknown"}`);
+      });
     }, 1400);
   };
 
@@ -2395,15 +2091,15 @@ Return STRICT JSON only (no markdown):
 
     return (
       <div
-        className={`mx-auto w-full min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm ${
-          compact ? "max-w-[840px]" : "max-w-[980px]"
+        className={`meeting-mode-shell meeting-mode-start mx-auto w-full min-w-0 rounded-2xl p-5 ${
+          compact ? "max-w-[680px]" : "max-w-[860px]"
         }`}
       >
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-sm font-bold text-gray-800">🎤 Start Meeting</h2>
-          <button onClick={onClose} className="rounded p-1 hover:bg-white/20">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-bold text-slate-900">🎤 Start Meeting</h2>
+          <button onClick={onClose} className="rounded-lg p-1.5 text-slate-600 transition hover:bg-slate-100">
             {compact ? (
-              <span className="px-2 text-[10px] font-semibold text-gray-700">Back</span>
+              <span className="px-2 text-sm font-semibold text-slate-700">Back</span>
             ) : (
               <X className="h-4 w-4 text-gray-600" />
             )}
@@ -2411,7 +2107,7 @@ Return STRICT JSON only (no markdown):
         </div>
 
         {error && (
-          <div className="mb-3 rounded border border-red-500/40 bg-red-500/20 p-2 text-[10px] text-red-700">{error}</div>
+          <div className="mb-3 rounded-lg border border-red-300 bg-red-50 p-2.5 text-sm text-red-700">{error}</div>
         )}
 
         <input
@@ -2419,17 +2115,17 @@ Return STRICT JSON only (no markdown):
           value={meetingTitle}
           onChange={(e) => setMeetingTitle(e.target.value)}
           placeholder="Meeting title..."
-          className="mb-3 w-full rounded-lg border border-white/40 bg-white/25 px-3 py-2 text-xs text-gray-800 placeholder-gray-500 backdrop-blur-md focus:outline-none focus:ring-1 focus:ring-gray-400/60"
+          className="mb-4 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
           onKeyDown={(e) => e.key === "Enter" && startRecording()}
           autoFocus
         />
 
-        <div className="mb-3 rounded-lg border border-white/30 bg-white/20 p-2">
-          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
+        <div className="meeting-section mb-4 rounded-xl p-3">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-700">
             RAG Folders (for interview answers)
           </div>
-          <div className="space-y-1 text-[10px] text-gray-700">
-            <label className="flex items-center gap-2 rounded border border-white/35 bg-white/50 px-2 py-1">
+          <div className="space-y-1.5 text-xs text-slate-700">
+            <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
               <input
                 type="checkbox"
                 checked={resourceScopeSelection.resume}
@@ -2439,7 +2135,7 @@ Return STRICT JSON only (no markdown):
               />
               Resume ({resources.resume.trim() ? "available" : "empty"})
             </label>
-            <label className="flex items-center gap-2 rounded border border-white/35 bg-white/50 px-2 py-1">
+            <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
               <input
                 type="checkbox"
                 checked={resourceScopeSelection.jd}
@@ -2450,11 +2146,11 @@ Return STRICT JSON only (no markdown):
               Interview JD ({selectedJdIds.size}/{resources.documents.length})
             </label>
             {resourceScopeSelection.jd && resources.documents.length > 0 && (
-              <div className="rounded border border-white/30 bg-white/35 p-1.5">
-                <div className="mb-1 text-[9px] font-semibold text-gray-700">Choose JD file(s)</div>
+              <div className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="mb-1 text-[11px] font-semibold text-slate-700">Choose JD file(s)</div>
                 <div className="max-h-20 space-y-1 overflow-y-auto">
                   {resources.documents.map((item) => (
-                    <label key={item.id} className="flex items-center gap-2 text-[9px] text-gray-700">
+                    <label key={item.id} className="flex items-center gap-2 text-[11px] text-slate-700">
                       <input
                         type="checkbox"
                         checked={selectedJdIds.has(item.id)}
@@ -2466,7 +2162,7 @@ Return STRICT JSON only (no markdown):
                 </div>
               </div>
             )}
-            <label className="flex items-center gap-2 rounded border border-white/35 bg-white/50 px-2 py-1">
+            <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
               <input
                 type="checkbox"
                 checked={resourceScopeSelection.resources}
@@ -2477,11 +2173,11 @@ Return STRICT JSON only (no markdown):
               Resource Folders ({selectedResourceFolderIds.size}/{resources.knowledgeFolders.length})
             </label>
             {resourceScopeSelection.resources && resources.knowledgeFolders.length > 0 && (
-              <div className="rounded border border-white/30 bg-white/35 p-1.5">
-                <div className="mb-1 text-[9px] font-semibold text-gray-700">Choose resource folders</div>
+              <div className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="mb-1 text-[11px] font-semibold text-slate-700">Choose resource folders</div>
                 <div className="max-h-24 space-y-1 overflow-y-auto">
                   {resources.knowledgeFolders.map((folder) => (
-                    <label key={folder.id} className="flex items-center gap-2 text-[9px] text-gray-700">
+                    <label key={folder.id} className="flex items-center gap-2 text-[11px] text-slate-700">
                       <input
                         type="checkbox"
                         checked={selectedResourceFolderIds.has(folder.id)}
@@ -2497,23 +2193,23 @@ Return STRICT JSON only (no markdown):
               </div>
             )}
           </div>
-          <div className="mt-2 text-[9px] text-gray-600">
+          <div className="mt-2 text-[11px] text-slate-600">
             AI will search only selected folders and can use multiple folders together.
           </div>
         </div>
 
-        <div className="mb-3 rounded-lg border border-white/30 bg-white/20 p-2">
-          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
+        <div className="meeting-section mb-4 rounded-xl p-3">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-700">
             Speech-To-Text Provider
           </div>
-          <label className="flex flex-col gap-1 text-[10px]">
-            <span className="text-gray-700">Provider</span>
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-slate-700">Provider</span>
             <select
               value={selectedSttProvider}
               onChange={(event) =>
                 setSelectedSttProvider(normalizeSttProviderChoice(event.target.value))
               }
-              className="rounded border border-white/40 bg-white/70 px-2 py-1 text-[10px] text-gray-800"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
             >
               <option value="auto">Auto ({envDefaultSttProvider})</option>
               <option value="elevenlabs">ElevenLabs Realtime</option>
@@ -2522,30 +2218,30 @@ Return STRICT JSON only (no markdown):
               <option value="google">Google Speech</option>
             </select>
           </label>
-          <div className="mt-2 text-[9px] text-gray-600">
+          <div className="mt-2 text-[11px] text-slate-600">
             Active provider: <strong>{resolvedSttProvider}</strong>.{" "}
             {useStreamingStt
               ? "Realtime streaming mode (supports interviewer audio capture)."
               : "Chunked mode (runs robust fallback chain through main pipeline)."}
           </div>
           {resolvedSttProvider === "puter" && (
-            <div className="mt-1 text-[9px] text-gray-600">
+            <div className="mt-1 text-[11px] text-slate-600">
               Uses Puter JS in renderer while keeping reconnect/backpressure/fallback orchestration in Electron main.
             </div>
           )}
         </div>
 
-        <div className="mb-3 rounded-lg border border-white/30 bg-white/20 p-2">
-          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
+        <div className="meeting-section mb-4 rounded-xl p-3">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-700">
             Performance Controls
           </div>
-          <div className="grid grid-cols-2 gap-2 text-[10px]">
+          <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
             <label className="flex flex-col gap-1">
-              <span className="text-gray-700">CPU Mode</span>
+              <span className="text-slate-700">CPU Mode</span>
               <select
                 value={cpuMode}
                 onChange={(event) => setCpuMode(event.target.value as CpuMode)}
-                className="rounded border border-white/40 bg-white/70 px-2 py-1 text-[10px] text-gray-800"
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
               >
                 <option value="low">Low CPU</option>
                 <option value="balanced">Balanced</option>
@@ -2553,28 +2249,28 @@ Return STRICT JSON only (no markdown):
               </select>
             </label>
             <label className="flex flex-col gap-1">
-              <span className="text-gray-700">Chunk Rate (ms)</span>
+              <span className="text-slate-700">Chunk Rate (ms)</span>
               <input
                 type="number"
                 min={600}
                 max={6000}
                 value={chunkRateMs}
                 onChange={(event) => setChunkRateMs(Math.max(600, Math.min(6000, Number(event.target.value) || 1800)))}
-                className="rounded border border-white/40 bg-white/70 px-2 py-1 text-[10px] text-gray-800"
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
               />
             </label>
             <label className="flex flex-col gap-1">
-              <span className="text-gray-700">Model Throttle (ms)</span>
+              <span className="text-slate-700">Model Throttle (ms)</span>
               <input
                 type="number"
                 min={0}
                 max={10000}
                 value={modelThrottleMs}
                 onChange={(event) => setModelThrottleMs(Math.max(0, Math.min(10000, Number(event.target.value) || 0)))}
-                className="rounded border border-white/40 bg-white/70 px-2 py-1 text-[10px] text-gray-800"
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
               />
             </label>
-            <label className="flex items-center gap-2 rounded border border-white/30 bg-white/40 px-2 py-1.5 text-[10px] text-gray-700">
+            <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-700">
               <input
                 type="checkbox"
                 checked={cloudOffload}
@@ -2589,16 +2285,16 @@ Return STRICT JSON only (no markdown):
         <button
           onClick={startRecording}
           disabled={!meetingTitle.trim()}
-          className="flex w-full items-center justify-center gap-2 rounded-lg bg-red-500/80 px-3 py-2 text-xs text-white shadow-lg hover:bg-red-600/80 disabled:bg-gray-400/50"
+          className="app-btn app-btn-primary flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-rose-500 to-red-600 px-3 py-3 text-base text-white shadow-lg hover:from-rose-600 hover:to-red-700 disabled:cursor-not-allowed disabled:opacity-55"
         >
           <Mic className="h-3 w-3" />
           Start Recording
         </button>
 
         {logs.length > 0 && (
-          <div className="mt-3 max-h-24 overflow-y-auto rounded bg-white/10 p-2 text-[9px]">
+          <div className="mt-3 max-h-28 overflow-y-auto rounded-lg border border-slate-200 bg-white p-2 text-xs">
             {logs.slice(-3).map((log, i) => (
-              <div key={i} className="mb-1 text-gray-700">
+              <div key={i} className="mb-1 text-slate-700">
                 {log.message}
               </div>
             ))}
@@ -2610,18 +2306,18 @@ Return STRICT JSON only (no markdown):
 
   return (
     <div
-      className={`chat-container liquid-glass mx-auto flex w-full min-w-0 flex-col p-4 ${
-        compact ? "max-w-[820px]" : "max-w-[960px]"
+      className={`meeting-mode-shell meeting-mode-live chat-container mx-auto flex w-full min-w-0 flex-col p-4 ${
+        compact ? "max-w-[700px]" : "max-w-[880px]"
       }`}
     >
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <div className="flex gap-1">
-          <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-[9px] text-white">
+          <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-xs text-white">
             <Mic className="h-3 w-3 text-white" />
             <span className="font-semibold">{meeting?.title}</span>
           </div>
           {meeting?.isRecording && (
-            <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-[9px] text-white">
+            <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-xs text-white">
               <div
                 className={`h-1.5 w-1.5 rounded-full ${
                   meeting.isPaused ? "bg-yellow-500" : "animate-pulse bg-red-500"
@@ -2637,14 +2333,14 @@ Return STRICT JSON only (no markdown):
             <>
               <button
                 onClick={togglePause}
-                className="flex items-center gap-1 rounded bg-yellow-500/80 px-2 py-1 text-[9px] text-white hover:bg-yellow-600/80"
+                className="flex items-center gap-1 rounded bg-yellow-500/80 px-2 py-1 text-xs text-white hover:bg-yellow-600/80"
               >
                 {meeting.isPaused ? <Play className="h-3 w-3" /> : <Pause className="h-3 w-3" />}
                 {meeting.isPaused ? "Resume" : "Pause"}
               </button>
               <button
                 onClick={stopRecording}
-                className="flex items-center gap-1 rounded bg-gray-600/80 px-2 py-1 text-[9px] text-white hover:bg-gray-700/80"
+                className="flex items-center gap-1 rounded bg-gray-600/80 px-2 py-1 text-xs text-white hover:bg-gray-700/80"
               >
                 <MicOff className="h-3 w-3" />
                 Stop
@@ -2653,7 +2349,7 @@ Return STRICT JSON only (no markdown):
           )}
           <button
             onClick={() => setShowDebug(!showDebug)}
-            className={`flex items-center gap-1 rounded px-2 py-1 text-[9px] text-white ${
+            className={`flex items-center gap-1 rounded px-2 py-1 text-xs text-white ${
               showDebug ? "bg-blue-500/80" : "bg-white/20"
             }`}
           >
@@ -2663,7 +2359,7 @@ Return STRICT JSON only (no markdown):
           <button
             onClick={compact ? handleEndMeeting : onClose}
             disabled={compact && isEndingMeeting}
-            className={`rounded px-2 py-1 text-[9px] text-white ${
+            className={`rounded px-2 py-1 text-xs text-white ${
               compact
                 ? "bg-red-500/80 hover:bg-red-600/80 disabled:cursor-not-allowed disabled:opacity-60"
                 : "bg-white/20"
@@ -2675,19 +2371,19 @@ Return STRICT JSON only (no markdown):
       </div>
 
       {meeting?.isRecording && (liveTranscript || partialTranscript) && (
-        <div className="mb-3 rounded-lg border border-blue-500/40 bg-gradient-to-r from-blue-500/20 to-green-500/20 p-3">
+        <div className="mb-3 rounded-xl border border-blue-300/45 bg-gradient-to-r from-sky-500/30 via-cyan-500/20 to-emerald-500/25 p-3">
           <div className="mb-1 flex items-center gap-1">
             <div className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-            <span className="text-[9px] font-bold text-white">LIVE</span>
+            <span className="text-xs font-bold text-white">LIVE</span>
           </div>
           {liveTranscript && (
-            <p className="mb-1 text-xs font-medium text-white">
+            <p className="mb-1 text-sm font-medium text-white">
               <span className="font-semibold text-white">{formatSourceLabel(liveTranscript.source)}:</span>{" "}
               {liveTranscript.text}
             </p>
           )}
           {partialTranscript && (
-            <p className="text-xs italic text-white/90">
+            <p className="text-sm italic text-white/90">
               <span className="font-semibold text-white">{formatSourceLabel(partialTranscript.source)}:</span>{" "}
               {partialTranscript.text}
             </p>
@@ -2696,7 +2392,7 @@ Return STRICT JSON only (no markdown):
       )}
 
       {sttStatus && (
-        <div className="mb-3 rounded-lg border border-white/25 bg-white/20 p-2 text-[10px] text-white">
+        <div className="mb-3 rounded-xl border border-white/35 bg-slate-900/45 p-2.5 text-xs text-slate-100">
           <div className="flex flex-wrap items-center gap-3">
             <span>
               Provider: <strong>{sttStatus.provider || "unknown"}</strong>
@@ -2709,18 +2405,20 @@ Return STRICT JSON only (no markdown):
         </div>
       )}
 
-      <div className={`mb-3 grid ${compact ? "min-h-[220px]" : "min-h-[300px]"} flex-1 grid-cols-1 gap-3 md:grid-cols-2`}>
+      <div
+        className={`mb-3 grid ${compact ? "min-h-[260px]" : "min-h-[320px]"} flex-1 grid-cols-1 gap-3 md:grid-cols-2`}
+      >
         <div
           ref={transcriptScrollRef}
-          className="glass-content max-h-[52vh] overflow-y-auto rounded-lg border border-white/20 bg-white/10 p-3 shadow-lg"
+          className="meeting-scroll-panel max-h-[52vh] overflow-y-auto rounded-xl p-3"
         >
           <div className="mb-2 flex items-center justify-between">
-            <h3 className="text-[11px] font-bold text-gray-800">Conversation</h3>
-            <span className="text-[9px] text-gray-500">{meeting?.transcripts.length || 0} lines</span>
+            <h3 className="text-sm font-bold text-gray-800">Conversation</h3>
+            <span className="text-xs text-gray-500">{meeting?.transcripts.length || 0} lines</span>
           </div>
 
           {(!meeting || meeting.transcripts.length === 0) && !partialTranscript && !liveTranscript && (
-            <div className="py-8 text-center text-[10px] text-gray-500">
+            <div className="py-8 text-center text-xs text-gray-500">
               <Mic className="mx-auto mb-2 h-8 w-8 opacity-30" />
               <p>Waiting for transcript...</p>
             </div>
@@ -2728,16 +2426,16 @@ Return STRICT JSON only (no markdown):
 
           <div className="space-y-2">
             {meeting?.transcripts.map((item, i) => (
-              <div key={`${item.timestamp}-${i}`} className="rounded border border-gray-200 bg-white/85 p-2">
+              <div key={`${item.timestamp}-${i}`} className="rounded-lg border border-gray-200 bg-white p-2.5">
                 <div className="mb-1 flex items-center justify-between">
-                  <span className="text-[9px] font-semibold text-blue-700">
+                  <span className="text-xs font-semibold text-blue-700">
                     {formatSourceLabel(item.source === "interviewer" ? "interviewer" : "user")}
                   </span>
-                  <span className="font-mono text-[8px] text-gray-500">
+                  <span className="font-mono text-[10px] text-gray-500">
                     {new Date(item.timestamp).toLocaleTimeString()}
                   </span>
                 </div>
-                <p className="text-[10px] text-gray-800">{item.text}</p>
+                <p className="text-sm text-gray-800">{item.text}</p>
               </div>
             ))}
 
@@ -2745,25 +2443,25 @@ Return STRICT JSON only (no markdown):
               <div className="rounded border border-blue-300/50 bg-blue-50/70 p-2">
                 <div className="mb-1 flex items-center gap-1">
                   <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
-                  <span className="text-[9px] font-semibold text-blue-700">
+                  <span className="text-xs font-semibold text-blue-700">
                     {formatSourceLabel(partialTranscript.source)} (live)
                   </span>
                 </div>
-                <p className="text-[10px] italic text-blue-900">{partialTranscript.text}</p>
+                <p className="text-sm italic text-blue-900">{partialTranscript.text}</p>
               </div>
             )}
           </div>
         </div>
 
-        <div className="glass-content max-h-[52vh] overflow-y-auto rounded-lg border border-white/20 bg-white/10 p-3 shadow-lg">
+        <div className="meeting-scroll-panel max-h-[52vh] overflow-y-auto rounded-xl p-3">
           <div className="mb-2 flex items-center justify-between">
-            <h3 className="text-[11px] font-bold text-gray-800">AI Answers</h3>
+            <h3 className="text-sm font-bold text-gray-800">AI Answers</h3>
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={handleAnswerFromScreen}
                 disabled={isScreenAnswering}
-                className={`rounded border px-2 py-1 text-[9px] font-semibold transition ${
+                className={`rounded border px-2 py-1 text-xs font-semibold transition ${
                   isScreenAnswering
                     ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-500"
                     : "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
@@ -2771,54 +2469,67 @@ Return STRICT JSON only (no markdown):
               >
                 {isScreenAnswering ? "Analyzing screen..." : "Answer from screen"}
               </button>
-              <span className="text-[9px] text-gray-500">{answers.length} items</span>
+              <span className="text-xs text-gray-500">{answers.length} items</span>
             </div>
           </div>
 
           {answers.length === 0 ? (
-            <div className="py-8 text-center text-[10px] text-gray-500">
+            <div className="py-8 text-center text-xs text-gray-500">
               <MessageSquare className="mx-auto mb-2 h-8 w-8 opacity-30" />
               <p>No answers yet</p>
-              <p className="mt-1 text-[9px] text-gray-400">
+              <p className="mt-1 text-xs text-gray-400">
                 Answers appear when a likely interview question is detected.
               </p>
               {!hasInterviewerAudioRef.current && (
-                <p className="mt-1 text-[9px] text-gray-400">Mic-only mode is active; question detection uses mic transcript.</p>
+                <p className="mt-1 text-xs text-gray-400">Mic-only mode is active; question detection uses mic transcript.</p>
               )}
             </div>
           ) : (
             <div className="space-y-2">
               {answers.map((item) => (
-                <div key={item.id} className="rounded border border-gray-200 bg-white/85 p-2">
+                <div key={item.id} className="rounded-lg border border-gray-200 bg-white p-2.5">
                   <div className="mb-1 flex items-center justify-between">
-                    <span className="text-[9px] font-semibold text-blue-700">Question</span>
-                    <span className="font-mono text-[8px] text-gray-500">
+                    <span className="text-xs font-semibold text-blue-700">Question</span>
+                    <span className="font-mono text-[10px] text-gray-500">
                       {new Date(item.createdAt).toLocaleTimeString()}
                     </span>
                   </div>
-                  <p className="mb-2 text-[10px] text-gray-800">{item.question}</p>
+                  <p className="mb-2 text-sm text-gray-800">{item.question}</p>
 
                   {typeof item.confidence === "number" && (
-                    <div className="mb-2 inline-flex items-center rounded bg-blue-50 px-2 py-0.5 text-[9px] font-semibold text-blue-700">
+                    <div className="mb-2 inline-flex items-center rounded bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700">
                       {item.confidence}% confidence
                     </div>
                   )}
 
                   {typeof item.qualityOverall === "number" && (
-                    <div className="mb-2 ml-1 inline-flex items-center rounded bg-emerald-50 px-2 py-0.5 text-[9px] font-semibold text-emerald-700">
+                    <div className="mb-2 ml-1 inline-flex items-center rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
                       {Math.round(item.qualityOverall * 100)}% quality
                     </div>
                   )}
 
-                  {item.status === "pending" && <div className="text-[9px] text-gray-500">Generating answer...</div>}
+                  {item.status === "pending" && <div className="text-xs text-gray-500">Generating answer...</div>}
                   {item.status === "error" && (
-                    <div className="text-[9px] text-red-600">{item.error || "Failed to generate answer."}</div>
+                    <div className="text-xs text-red-600">{item.error || "Failed to generate answer."}</div>
                   )}
                   {item.status === "ready" && item.response && (
                     <div className="space-y-2">
-                      <div className="whitespace-pre-wrap text-[10px] text-gray-800">{item.response}</div>
+                      <div className="flex flex-wrap items-center gap-1">
+                        <span className="rounded bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                          {item.stage === "refined" ? "Refined" : "Fast draft"}
+                        </span>
+                        {item.isRefining && (
+                          <span className="rounded bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                            Refining...
+                          </span>
+                        )}
+                        {item.qualityNotes && (
+                          <span className="text-[10px] text-slate-500">{item.qualityNotes}</span>
+                        )}
+                      </div>
+                      <div className="whitespace-pre-wrap text-sm text-gray-800">{item.response}</div>
 
-                      <div className="rounded bg-slate-50 px-2 py-1 text-[9px] text-slate-700">
+                      <div className="rounded bg-slate-50 px-2 py-1 text-xs text-slate-700">
                         <div className="mb-1 font-semibold">Need another angle?</div>
                         <div className="flex flex-wrap gap-1">
                           {getExpansionSuggestions(item).map((suggestion) => {
@@ -2835,7 +2546,7 @@ Return STRICT JSON only (no markdown):
                                 type="button"
                                 disabled={pendingSamePrompt}
                                 onClick={() => requestAnswerExpansion(item.id, suggestion)}
-                                className={`rounded border px-2 py-0.5 text-[9px] ${
+                                className={`rounded border px-2 py-0.5 text-xs ${
                                   pendingSamePrompt
                                     ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-500"
                                     : "border-slate-300 bg-white text-slate-700 hover:bg-slate-100"
@@ -2849,20 +2560,20 @@ Return STRICT JSON only (no markdown):
                       </div>
 
                       {item.deepDives && item.deepDives.length > 0 && (
-                        <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[9px] text-amber-900">
+                        <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-900">
                           <div className="mb-1 font-semibold">More details</div>
                           <div className="space-y-1">
                             {item.deepDives.map((dive) => (
                               <div key={dive.id} className="rounded border border-amber-100 bg-white/70 px-2 py-1">
-                                <div className="mb-0.5 text-[8px] font-semibold text-amber-700">{dive.prompt}</div>
+                                <div className="mb-0.5 text-[10px] font-semibold text-amber-700">{dive.prompt}</div>
                                 {dive.status === "pending" && (
-                                  <div className="text-[8px] text-amber-700">Generating details...</div>
+                                  <div className="text-[10px] text-amber-700">Generating details...</div>
                                 )}
                                 {dive.status === "error" && (
-                                  <div className="text-[8px] text-red-600">{dive.error || "Failed to generate details."}</div>
+                                  <div className="text-[10px] text-red-600">{dive.error || "Failed to generate details."}</div>
                                 )}
                                 {dive.status === "ready" && (
-                                  <div className="whitespace-pre-wrap text-[9px] text-amber-900">
+                                  <div className="whitespace-pre-wrap text-xs text-amber-900">
                                     {dive.response}
                                   </div>
                                 )}
@@ -2873,7 +2584,7 @@ Return STRICT JSON only (no markdown):
                       )}
 
                       {item.understanding && (
-                        <div className="rounded bg-indigo-50 px-2 py-1 text-[9px] text-indigo-700">
+                        <div className="rounded bg-indigo-50 px-2 py-1 text-xs text-indigo-700">
                           <div className="font-semibold">Extracted constraints / edge cases</div>
                           <div className="mt-1">
                             Constraints: {item.understanding.constraints.join(", ") || "none"}
@@ -2884,7 +2595,7 @@ Return STRICT JSON only (no markdown):
                         </div>
                       )}
                       {(item.provider || item.model || typeof item.latencyMs === "number") && (
-                        <div className="text-[8px] text-gray-500">
+                        <div className="text-[10px] text-gray-500">
                           {item.provider ? `Provider: ${item.provider}` : "Provider: unknown"}{" "}
                           {item.model ? `• Model: ${item.model}` : ""}{" "}
                           {typeof item.latencyMs === "number" ? `• ${item.latencyMs}ms` : ""}
@@ -2901,7 +2612,7 @@ Return STRICT JSON only (no markdown):
 
       {showDebug && (
         <div className="mb-3 max-h-32 overflow-y-auto rounded bg-gray-900/90 p-2">
-          <div className="space-y-0.5 font-mono text-[8px]">
+          <div className="space-y-0.5 font-mono text-[10px]">
             {logs.map((log, i) => (
               <div
                 key={i}

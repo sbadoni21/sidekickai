@@ -9,7 +9,7 @@ const DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 const DEFAULT_GROQ_STT_MODEL = "whisper-large-v3-turbo"
 const DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 const DEFAULT_ELEVENLABS_STT_MODEL = "scribe_v1"
-const DEFAULT_PROVIDER_CHAIN: SttProvider[] = ["elevenlabs", "puter", "groq"]
+const DEFAULT_PROVIDER_CHAIN: SttProvider[] = ["puter", "groq"]
 
 export const isSttProvider = (value: string): value is SttProvider => {
   return value === "groq" || value === "google" || value === "elevenlabs" || value === "puter"
@@ -35,7 +35,7 @@ const appendFallbackProviders = (providers: SttProvider[]): SttProvider[] => {
   const includeGoogle =
     providers.includes("google") || shouldAllowGoogleFallback()
   const fallbackProviders: SttProvider[] = includeGoogle
-    ? ["elevenlabs", "google", "puter", "groq"]
+    ? ["google", "puter", "groq", "elevenlabs"]
     : DEFAULT_PROVIDER_CHAIN
 
   const next = [...providers]
@@ -49,7 +49,7 @@ export const resolveSttProvider = (): SttProvider => {
   const configured = (
     process.env.STT_PROVIDER ||
     process.env.VITE_STT_PROVIDER ||
-    "elevenlabs"
+    "puter"
   )
     .trim()
     .toLowerCase()

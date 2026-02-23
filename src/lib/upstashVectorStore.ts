@@ -1,3 +1,4 @@
+import { DEFAULT_KNOWLEDGE_FOLDER_ID } from "./resourcesStore"
 import type { ResourceFolderType, ResourceItem, UserResources } from "./resourcesStore"
 
 type WorkspaceFolder = "resume" | "jd" | "resource"
@@ -26,6 +27,22 @@ export interface UpstashQueryMatch {
   score: number
   data: string
   metadata: VectorMetadata
+}
+
+export interface HybridQueryMatch extends UpstashQueryMatch {
+  retrieval: "vector" | "lexical" | "hybrid"
+  vectorScore: number
+  lexicalScore: number
+  fusedScore: number
+}
+
+export interface HybridQueryOptions {
+  resources: UserResources
+  includeFolders?: WorkspaceFolder[]
+  selectedJdIds?: string[]
+  selectedResourceFolderIds?: string[]
+  topKVector?: number
+  finalTopK?: number
 }
 
 export interface UpstashSyncResult {
@@ -111,6 +128,21 @@ const chunkText = (text: string, chunkSize = 850, overlap = 120): string[] => {
     start = Math.max(0, end - overlap)
   }
   return chunks
+}
+
+const tokenize = (text: string): string[] =>
+  (text.toLowerCase().match(/[a-z0-9]+/g) || []).filter(token => token.length > 2)
+
+const lexicalOverlapScore = (queryTokens: string[], title: string, content: string): number => {
+  if (queryTokens.length === 0) return 0
+  const titleText = title.toLowerCase()
+  const contentText = content.toLowerCase()
+  let score = 0
+  queryTokens.forEach(token => {
+    if (titleText.includes(token)) score += 2.2
+    else if (contentText.includes(token)) score += 1
+  })
+  return score / Math.max(1, queryTokens.length)
 }
 
 const toVectorId = (
@@ -303,4 +335,161 @@ export const queryWorkspaceVectors = async (
     includeData: true
   })
   return parseQueryMatches(payload)
+}
+
+export const queryWorkspaceHybrid = async (
+  userId: string,
+  query: string,
+  options: HybridQueryOptions
+): Promise<HybridQueryMatch[]> => {
+  if (!query.trim()) return []
+
+  const includeFolders = new Set<WorkspaceFolder>(options.includeFolders || ["resume", "jd", "resource"])
+  const selectedJdIds = new Set(options.selectedJdIds || [])
+  const selectedResourceFolderIds = new Set(options.selectedResourceFolderIds || [])
+  const queryTokens = tokenize(query)
+
+  const vectorTopK = Math.max(1, Math.min(12, Math.floor(options.topKVector || 8)))
+  const finalTopK = Math.max(1, Math.min(12, Math.floor(options.finalTopK || 7)))
+
+  let vectorMatches: UpstashQueryMatch[] = []
+  try {
+    vectorMatches = await queryWorkspaceVectors(userId, query, vectorTopK)
+  } catch {
+    vectorMatches = []
+  }
+
+  const filteredVectorMatches = vectorMatches.filter(match => {
+    const folder = match.metadata.folder
+    if (!includeFolders.has(folder)) return false
+    if (folder === "jd" && selectedJdIds.size > 0) {
+      return selectedJdIds.has(match.metadata.resourceId)
+    }
+    if (folder === "resource" && selectedResourceFolderIds.size > 0) {
+      return selectedResourceFolderIds.has(match.metadata.resourceFolderId || DEFAULT_KNOWLEDGE_FOLDER_ID)
+    }
+    return true
+  })
+
+  const lexicalCandidates: Array<{
+    id: string
+    data: string
+    metadata: VectorMetadata
+    lexicalScore: number
+  }> = []
+
+  const now = Date.now()
+  if (includeFolders.has("resume") && options.resources.resume.trim()) {
+    lexicalCandidates.push({
+      id: `${userId}-resume-lexical`,
+      data: options.resources.resume.trim(),
+      lexicalScore: lexicalOverlapScore(queryTokens, "Candidate Resume", options.resources.resume),
+      metadata: {
+        userId,
+        folder: "resume",
+        resourceId: "resume",
+        title: "Candidate Resume",
+        chunkIndex: 0,
+        updatedAt: now
+      }
+    })
+  }
+
+  if (includeFolders.has("jd")) {
+    options.resources.documents.forEach(item => {
+      if (selectedJdIds.size > 0 && !selectedJdIds.has(item.id)) return
+      if (!item.content.trim()) return
+      lexicalCandidates.push({
+        id: `${userId}-jd-${item.id}-lexical`,
+        data: item.content.trim(),
+        lexicalScore: lexicalOverlapScore(queryTokens, item.title, item.content),
+        metadata: {
+          userId,
+          folder: "jd",
+          resourceId: item.id,
+          title: item.title,
+          url: item.url,
+          chunkIndex: 0,
+          updatedAt: item.updatedAt
+        }
+      })
+    })
+  }
+
+  if (includeFolders.has("resource")) {
+    const folderById = new Map(options.resources.knowledgeFolders.map(folder => [folder.id, folder] as const))
+    options.resources.knowledge.forEach(item => {
+      const folderId = item.folderId || DEFAULT_KNOWLEDGE_FOLDER_ID
+      if (selectedResourceFolderIds.size > 0 && !selectedResourceFolderIds.has(folderId)) return
+      if (!item.content.trim()) return
+      const linkedFolder = folderById.get(folderId)
+      lexicalCandidates.push({
+        id: `${userId}-resource-${item.id}-lexical`,
+        data: item.content.trim(),
+        lexicalScore: lexicalOverlapScore(queryTokens, item.title, item.content),
+        metadata: {
+          userId,
+          folder: "resource",
+          resourceId: item.id,
+          title: item.title,
+          url: item.url,
+          resourceFolderId: linkedFolder?.id || folderId,
+          resourceFolderName: linkedFolder?.name,
+          resourceFolderType: linkedFolder?.type,
+          chunkIndex: 0,
+          updatedAt: item.updatedAt
+        }
+      })
+    })
+  }
+
+  const fusionByKey = new Map<string, HybridQueryMatch>()
+
+  filteredVectorMatches.forEach((match, index, all) => {
+    const vectorScore = Math.max(0, 1 - index / Math.max(1, all.length))
+    const lexicalScore = Math.max(
+      0,
+      Math.min(1, lexicalOverlapScore(queryTokens, match.metadata.title, match.data) / 3)
+    )
+    const fusedScore = Math.max(0, Math.min(1, vectorScore * 0.68 + lexicalScore * 0.32))
+    const key = `${match.metadata.folder}:${match.metadata.resourceId}:${match.metadata.chunkIndex}`
+    fusionByKey.set(key, {
+      ...match,
+      retrieval: lexicalScore > 0 ? "hybrid" : "vector",
+      vectorScore,
+      lexicalScore,
+      fusedScore
+    })
+  })
+
+  lexicalCandidates
+    .filter(item => item.lexicalScore > 0)
+    .forEach(item => {
+      const key = `${item.metadata.folder}:${item.metadata.resourceId}:lexical`
+      const lexicalScore = Math.max(0, Math.min(1, item.lexicalScore / 3))
+      const existing = fusionByKey.get(key)
+      if (existing) {
+        existing.lexicalScore = Math.max(existing.lexicalScore, lexicalScore)
+        existing.fusedScore = Math.max(existing.fusedScore, existing.vectorScore * 0.7 + existing.lexicalScore * 0.3)
+        if (existing.vectorScore > 0) {
+          existing.retrieval = "hybrid"
+        }
+        return
+      }
+
+      fusionByKey.set(key, {
+        id: item.id,
+        score: lexicalScore,
+        data: item.data.slice(0, 1200),
+        metadata: item.metadata,
+        retrieval: "lexical",
+        vectorScore: 0,
+        lexicalScore,
+        fusedScore: lexicalScore
+      })
+    })
+
+  return Array.from(fusionByKey.values())
+    .sort((a, b) => b.fusedScore - a.fusedScore)
+    .slice(0, finalTopK)
 }

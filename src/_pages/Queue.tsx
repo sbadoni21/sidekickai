@@ -66,7 +66,6 @@ const Queue: React.FC<QueueProps> = ({
   const [isMeetingOpen, setIsMeetingOpen] = useState(isMeetingOnlyMode)
   const [meetingEndRequestToken, setMeetingEndRequestToken] = useState(0)
   const [isResourcesOpen, setIsResourcesOpen] = useState(false)
-  const [isIncognitoMode, setIsIncognitoMode] = useState(false)
   const [lockWindowResize, setLockWindowResize] = useState(false)
 
   // Abort controller
@@ -216,24 +215,6 @@ const Queue: React.FC<QueueProps> = ({
       }
       return next
     })
-  }
-
-  const handleIncognitoToggle = async () => {
-    try {
-      const result = await window.electronAPI.toggleIncognitoMode()
-      const enabled = Boolean(result.enabled)
-      setIsIncognitoMode(enabled)
-      showToast(
-        enabled ? "Incognito On" : "Incognito Off",
-        enabled
-          ? "Stealth mode ON: always on top and harder to capture in screenshots."
-          : "Stealth mode OFF: normal window layering and screenshot capture allowed.",
-        "neutral"
-      )
-    } catch (error) {
-      console.error("Failed to toggle incognito mode:", error)
-      showToast("Error", "Unable to toggle incognito mode.", "error")
-    }
   }
 
   useEffect(() => {
@@ -459,34 +440,6 @@ Be thorough and educational.`;
   }, []);
 
   useEffect(() => {
-    let isMounted = true
-
-    const loadIncognitoMode = async () => {
-      try {
-        const state = await window.electronAPI.getIncognitoMode()
-        if (isMounted) {
-          setIsIncognitoMode(Boolean(state.enabled))
-        }
-      } catch (error) {
-        console.error("Error loading incognito mode:", error)
-      }
-    }
-
-    loadIncognitoMode()
-
-    const unsubscribe = window.electronAPI.onIncognitoModeChanged((enabled: boolean) => {
-      if (isMounted) {
-        setIsIncognitoMode(Boolean(enabled))
-      }
-    })
-
-    return () => {
-      isMounted = false
-      unsubscribe()
-    }
-  }, [])
-
-  useEffect(() => {
     const updateDimensions = () => {
       if (contentRef.current) {
         let contentHeight = contentRef.current.scrollHeight
@@ -634,11 +587,11 @@ const resizeObserver = new ResizeObserver(() => {
   };
 
   return (
-    <div>
+    <div className={`app-page-shell min-h-full ${isMeetingOnlyMode ? "meeting-overlay-page" : ""}`}>
     <div
       ref={barRef}
 
-      className="select-none"
+      className={`select-none px-2 py-2 ${isMeetingOnlyMode ? "meeting-overlay-layout" : ""}`}
     >
       <div className="bg-transparent w-full">
         <div className="px-2 py-1">
@@ -660,8 +613,6 @@ const resizeObserver = new ResizeObserver(() => {
   onSettingsToggle={handleSettingsToggle}
   onMeetingToggle={handleMeetingToggle}  // ADD THIS LINE
   onResourcesToggle={handleResourcesToggle}
-  onIncognitoToggle={handleIncognitoToggle}
-  isIncognitoMode={isIncognitoMode}
   onVoiceResult={handleVoiceResult}
   meetingOnly={isMeetingOnlyMode}
   onEndMeeting={handleEndMeeting}
@@ -677,7 +628,7 @@ const resizeObserver = new ResizeObserver(() => {
           
           {/* Chat Interface with Multiple Modes */}
           {!isMeetingOnlyMode && isChatOpen && (
-            <div className="mt-4 w-full mx-auto liquid-glass chat-container p-4 flex flex-col">
+            <div className="app-anim-rise mt-4 mx-auto flex w-full flex-col liquid-glass chat-container p-4">
               {/* Mode Selector Bar */}
               <div className="mb-3 flex gap-2 items-center justify-between flex-wrap">
                 <div className="flex gap-1">
@@ -685,7 +636,7 @@ const resizeObserver = new ResizeObserver(() => {
                     onClick={() => setResponseMode("code-only")}
                     className={`px-2 py-1 text-[9px] rounded transition-all ${
                       responseMode === "code-only"
-                        ? "bg-purple-500/80 text-white shadow-md"
+                        ? "bg-sky-500/85 text-white shadow-md"
                         : "bg-white/20 text-gray-300 hover:bg-white/30"
                     }`}
                     title="Code only, minimal theory (2-3 sec)"
@@ -696,7 +647,7 @@ const resizeObserver = new ResizeObserver(() => {
                     onClick={() => setResponseMode("theory-only")}
                     className={`px-2 py-1 text-[9px] rounded transition-all ${
                       responseMode === "theory-only"
-                        ? "bg-blue-500/80 text-white shadow-md"
+                        ? "bg-indigo-500/85 text-white shadow-md"
                         : "bg-white/20 text-gray-300 hover:bg-white/30"
                     }`}
                     title="Theory only, no code (3-4 sec)"
@@ -850,7 +801,7 @@ const resizeObserver = new ResizeObserver(() => {
     </div>
 {isMeetingOpen &&
   (isMeetingOnlyMode ? (
-    <div className="mt-3 flex w-full justify-center">
+    <div className="meeting-overlay-panel mt-3 flex w-full justify-center">
       <MeetingMode
         onClose={closeMeetingMode}
         onMeetingSaved={onMeetingSaved}
@@ -859,7 +810,7 @@ const resizeObserver = new ResizeObserver(() => {
       />
     </div>
   ) : (
-    <div className="mt-3 flex w-full justify-center rounded-2xl border border-white/15 bg-black/50 p-4 backdrop-blur-sm">
+    <div className="mt-3 flex w-full justify-center rounded-2xl border border-white/35 bg-slate-900/55 p-4 backdrop-blur-md">
       <MeetingMode
         onClose={closeMeetingMode}
         onMeetingSaved={onMeetingSaved}
@@ -869,7 +820,7 @@ const resizeObserver = new ResizeObserver(() => {
     </div>
   ))}
        {!isMeetingOnlyMode && isResourcesOpen && (
-  <div className="mt-3 w-full rounded-2xl border border-white/15 bg-black/50 p-4 backdrop-blur-sm">
+  <div className="mt-3 w-full rounded-2xl border border-white/35 bg-slate-900/55 p-4 backdrop-blur-md">
     <Resources onClose={() => setIsResourcesOpen(false)} />
   </div>
 )}

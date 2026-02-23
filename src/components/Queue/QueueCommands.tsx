@@ -7,8 +7,6 @@ interface QueueCommandsProps {
   onSettingsToggle: () => void
   onMeetingToggle: () => void  // New prop for meeting mode
   onResourcesToggle: () => void
-  onIncognitoToggle: () => void
-  isIncognitoMode: boolean
   onVoiceResult?: (text: string) => void
   meetingOnly?: boolean
   onEndMeeting?: () => void
@@ -21,8 +19,6 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
   onSettingsToggle,
   onMeetingToggle,
   onResourcesToggle,
-  onIncognitoToggle,
-  isIncognitoMode,
   onVoiceResult,
   meetingOnly = false,
   onEndMeeting
@@ -32,6 +28,13 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
   const [isRecording, setIsRecording] = useState(false)
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null)
   const chunks = useRef<Blob[]>([])
+  const barToneClass = meetingOnly ? "queue-command-bar--light text-slate-800" : "text-white/95"
+  const keyHintClass = meetingOnly
+    ? "bg-slate-200 hover:bg-slate-300 text-slate-700"
+    : "bg-white/10 hover:bg-white/20 text-white/70"
+  const compactActionClass = meetingOnly
+    ? "bg-slate-200 hover:bg-slate-300 text-slate-700"
+    : "bg-white/10 hover:bg-white/20 text-white/70"
 
   useEffect(() => {
     let tooltipHeight = 0
@@ -98,15 +101,15 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
 
   return (
     <div className="w-fit">
-      <div className="text-xs text-white/90 liquid-glass-bar py-1 px-4 flex items-center justify-center gap-4 draggable-area">
+      <div className={`queue-command-bar liquid-glass-bar draggable-area flex items-center justify-center gap-4 px-4 py-1 text-xs ${barToneClass}`}>
         {/* Show/Hide */}
         <div className="flex items-center gap-2">
-          <span className="text-[11px] leading-none">Show/Hide</span>
+            <span className="text-xs leading-none">Show/Hide</span>
           <div className="flex gap-1">
-            <button className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none text-white/70">
+            <button className={`${keyHintClass} transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none`}>
               ⌘
             </button>
-            <button className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none text-white/70">
+            <button className={`${keyHintClass} transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none`}>
               B
             </button>
           </div>
@@ -115,7 +118,7 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
         {meetingOnly && onEndMeeting && (
           <div className="flex items-center gap-2">
             <button
-              className="bg-red-500/70 hover:bg-red-600/80 transition-colors rounded-md px-2 py-1 text-[11px] leading-none text-white"
+              className="app-btn app-btn-danger rounded-md px-2 py-1 text-xs leading-none text-white shadow-sm"
               onClick={onEndMeeting}
               type="button"
             >
@@ -129,10 +132,10 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
           <div className="flex items-center gap-2">
             <span className="text-[11px] leading-none">Solve</span>
             <div className="flex gap-1">
-              <button className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none text-white/70">
+              <button className={`${keyHintClass} transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none`}>
                 ⌘
               </button>
-              <button className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none text-white/70">
+              <button className={`${keyHintClass} transition-colors rounded-md px-1.5 py-1 text-[11px] leading-none`}>
                 ↵
               </button>
             </div>
@@ -143,7 +146,7 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
         {!meetingOnly && (
           <div className="flex items-center gap-2">
             <button
-              className={`bg-white/10 hover:bg-white/20 transition-colors rounded-md px-2 py-1 text-[11px] leading-none text-white/70 flex items-center gap-1 ${
+              className={`${compactActionClass} transition-colors rounded-md px-2 py-1 text-[11px] leading-none flex items-center gap-1 ${
                 isRecording ? 'bg-red-500/70 hover:bg-red-500/90 animate-pulse' : ''
               }`}
               onClick={handleRecordClick}
@@ -165,7 +168,7 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
         {!meetingOnly && (
           <div className="flex items-center gap-2">
             <button
-              className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-2 py-1 text-[11px] leading-none text-white/70 flex items-center gap-1"
+              className={`${compactActionClass} transition-colors rounded-md px-2 py-1 text-[11px] leading-none flex items-center gap-1`}
               onClick={onMeetingToggle}
               type="button"
             >
@@ -178,7 +181,7 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
         {!meetingOnly && (
           <div className="flex items-center gap-2">
             <button
-              className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-2 py-1 text-[11px] leading-none text-white/70 flex items-center gap-1"
+              className={`${compactActionClass} transition-colors rounded-md px-2 py-1 text-[11px] leading-none flex items-center gap-1`}
               onClick={onResourcesToggle}
               type="button"
             >
@@ -187,27 +190,11 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
           </div>
         )}
 
-        {/* Incognito Mode Toggle */}
-        <div className="flex items-center gap-2">
-          <button
-            className={`transition-colors rounded-md px-2 py-1 text-[11px] leading-none flex items-center gap-1 ${
-              isIncognitoMode
-                ? "bg-amber-500/80 hover:bg-amber-500 text-black"
-                : "bg-white/10 hover:bg-white/20 text-white/70"
-            }`}
-            onClick={onIncognitoToggle}
-            type="button"
-            title="Toggle stealth mode (always-on-top + capture protection)"
-          >
-            {isIncognitoMode ? "🕶 Incognito ON" : "🕶 Incognito"}
-          </button>
-        </div>
-
         {/* Chat Button */}
         {!meetingOnly && (
           <div className="flex items-center gap-2">
             <button
-              className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-2 py-1 text-[11px] leading-none text-white/70 flex items-center gap-1"
+              className={`${compactActionClass} transition-colors rounded-md px-2 py-1 text-[11px] leading-none flex items-center gap-1`}
               onClick={onChatToggle}
               type="button"
             >
@@ -220,7 +207,7 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
         {!meetingOnly && (
           <div className="flex items-center gap-2">
             <button
-              className="bg-white/10 hover:bg-white/20 transition-colors rounded-md px-2 py-1 text-[11px] leading-none text-white/70 flex items-center gap-1"
+              className={`${compactActionClass} transition-colors rounded-md px-2 py-1 text-[11px] leading-none flex items-center gap-1`}
               onClick={onSettingsToggle}
               type="button"
             >

@@ -2,6 +2,24 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --app-bg-base: #f2f6ff;
+  --app-bg-soft: #e8f1ff;
+  --app-bg-deep: #dce9ff;
+  --app-card: #ffffff;
+  --app-card-soft: #f8fbff;
+  --app-border: #d8e1f0;
+  --app-border-strong: #becbe0;
+  --app-ink: #0f172a;
+  --app-ink-soft: #42526a;
+  --app-accent: #2563eb;
+  --app-accent-2: #0ea5e9;
+  --app-success: #0f766e;
+  --app-danger: #dc2626;
+  --app-shadow-lg: 0 22px 55px rgba(15, 23, 42, 0.22);
+  --app-shadow-md: 0 12px 28px rgba(15, 23, 42, 0.14);
+}
+
 html,
 body,
 #root {
@@ -10,18 +28,575 @@ body,
   background: transparent;
 }
 
+body {
+  font-family: "Manrope", "Segoe UI", sans-serif;
+  color: var(--app-ink);
+}
+
+.app-page-shell {
+  min-height: 100%;
+  background:
+    radial-gradient(1200px 700px at 10% -10%, rgba(37, 99, 235, 0.16), transparent 68%),
+    radial-gradient(1000px 650px at 100% 100%, rgba(14, 165, 233, 0.14), transparent 72%),
+    linear-gradient(160deg, var(--app-bg-base), var(--app-bg-soft) 55%, var(--app-bg-deep));
+  animation: appPageIn 360ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.app-page-surface {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(247, 251, 255, 0.94));
+}
+
 .app-window-shell {
+  position: relative;
   width: 100%;
   min-height: 100%;
-  background: #ffffff;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 250, 255, 0.95));
   border-radius: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.55);
-  outline: 1px solid rgba(15, 23, 42, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  outline: 1px solid rgba(15, 23, 42, 0.18);
   outline-offset: -1px;
   overflow: hidden;
   box-shadow:
-    0 16px 36px rgba(15, 23, 42, 0.3),
+    0 22px 48px rgba(15, 23, 42, 0.32),
     inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  transition: border-color 300ms ease, box-shadow 340ms ease, background 340ms ease;
+}
+
+.app-window-shell::before,
+.app-window-shell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.app-window-shell::before {
+  opacity: 0;
+  background:
+    radial-gradient(900px 420px at 15% 0%, rgba(20, 184, 166, 0.12), transparent 62%),
+    radial-gradient(800px 420px at 100% 100%, rgba(14, 165, 233, 0.12), transparent 62%);
+  transition: opacity 280ms ease;
+}
+
+.app-window-shell.app-incognito-mode {
+  border-color: rgba(99, 102, 241, 0.35);
+  box-shadow:
+    0 18px 42px rgba(15, 23, 42, 0.38),
+    0 0 0 1px rgba(99, 102, 241, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.app-window-shell.app-incognito-mode::before {
+  opacity: 1;
+}
+
+.app-window-shell.app-window-shell-meeting {
+  width: 920px;
+  min-height: auto;
+  background: linear-gradient(180deg, rgba(18, 26, 44, 0.24), rgba(16, 24, 40, 0.2));
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  outline: 1px solid rgba(148, 163, 184, 0.38);
+  box-shadow:
+    0 22px 48px rgba(15, 23, 42, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+
+.app-window-shell.app-window-shell-meeting::before {
+  opacity: 0.78;
+}
+
+.app-window-shell.app-window-shell-meeting .app-global-nav {
+  background: linear-gradient(180deg, rgba(241, 246, 255, 0.26), rgba(228, 238, 252, 0.2));
+  border-bottom-color: rgba(203, 213, 225, 0.34);
+}
+
+.app-window-shell.app-incognito-animating::after {
+  background: linear-gradient(
+    115deg,
+    transparent 0%,
+    rgba(56, 189, 248, 0.16) 36%,
+    rgba(99, 102, 241, 0.2) 50%,
+    rgba(45, 212, 191, 0.16) 64%,
+    transparent 100%
+  );
+  transform: translateX(-115%);
+  animation: appIncognitoSweep 680ms cubic-bezier(0.2, 0.75, 0.2, 1);
+}
+
+.app-auth-layout {
+  display: flex;
+  min-height: 100%;
+  width: 100%;
+  flex-direction: column;
+}
+
+.app-auth-content {
+  position: relative;
+}
+
+.app-auth-content.app-auth-content-meeting {
+  background: transparent;
+}
+
+.meeting-overlay-page {
+  background: transparent;
+}
+
+.meeting-overlay-layout {
+  margin-left: auto;
+  margin-right: auto;
+  width: 100%;
+  max-width: 900px;
+}
+
+.meeting-overlay-panel {
+  width: 100%;
+}
+
+.app-global-nav {
+  position: sticky;
+  top: 0;
+  z-index: 70;
+  border-bottom: 1px solid rgba(203, 213, 225, 0.75);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(247, 251, 255, 0.88));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: background 260ms ease, border-color 260ms ease, box-shadow 260ms ease;
+}
+
+.app-global-nav.is-incognito {
+  border-bottom-color: rgba(129, 140, 248, 0.42);
+  background: linear-gradient(180deg, rgba(246, 248, 255, 0.94), rgba(238, 246, 255, 0.88));
+  box-shadow: inset 0 -1px 0 rgba(129, 140, 248, 0.24);
+}
+
+.app-global-drag-strip {
+  -webkit-app-region: drag;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 14px 2px;
+}
+
+.app-global-drag-label {
+  border: 1px solid #c9d6ec;
+  border-radius: 999px;
+  padding: 3px 20px;
+  background: linear-gradient(180deg, #f7fbff, #ecf3ff);
+  color: #60708b;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.app-global-nav-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px 10px;
+  -webkit-app-region: drag;
+}
+
+.app-global-nav-row button {
+  -webkit-app-region: no-drag;
+}
+
+.app-global-user-card {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #d8e3f3;
+  border-radius: 12px;
+  padding: 6px 8px;
+  background: linear-gradient(180deg, #ffffff, #f7fbff);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.82);
+}
+
+.app-global-user-avatar {
+  display: flex;
+  height: 30px;
+  width: 30px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #2563eb, #0ea5e9);
+  color: white;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.app-global-user-meta {
+  min-width: 0;
+}
+
+.app-global-user-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.app-global-user-email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 1px;
+  font-size: 10px;
+  color: #64748b;
+}
+
+.app-global-tabs {
+  display: inline-flex;
+  align-items: center;
+  justify-self: center;
+  gap: 8px;
+  border: 1px solid #d8e3f3;
+  border-radius: 12px;
+  padding: 5px;
+  background: linear-gradient(180deg, #ffffff, #f6fafe);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.app-global-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  padding: 7px 10px;
+  background: transparent;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  transition: border-color 180ms ease, background-color 180ms ease, color 180ms ease, transform 180ms ease;
+}
+
+.app-global-tab:hover {
+  transform: translateY(-1px);
+  border-color: #d4ddee;
+  background: #f7fbff;
+  color: #1e293b;
+}
+
+.app-global-tab.is-active {
+  border-color: rgba(37, 99, 235, 0.36);
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(14, 165, 233, 0.14));
+  color: #1d4ed8;
+}
+
+.app-global-actions {
+  display: flex;
+  justify-self: end;
+  align-items: center;
+  gap: 8px;
+}
+
+.app-incognito-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #cdd9ec;
+  border-radius: 10px;
+  padding: 6px 9px;
+  background: linear-gradient(180deg, #ffffff, #f2f7ff);
+  color: #334155;
+  font-size: 11px;
+  font-weight: 700;
+  transition: border-color 220ms ease, background-color 220ms ease, box-shadow 220ms ease, transform 180ms ease;
+}
+
+.app-incognito-toggle:hover {
+  transform: translateY(-1px);
+  border-color: #b6c8e8;
+}
+
+.app-incognito-toggle:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.app-incognito-toggle[data-enabled="true"] {
+  border-color: rgba(79, 70, 229, 0.36);
+  background: linear-gradient(135deg, rgba(79, 70, 229, 0.12), rgba(45, 212, 191, 0.2));
+  box-shadow: 0 8px 18px rgba(79, 70, 229, 0.2);
+}
+
+.app-incognito-track {
+  position: relative;
+  display: inline-flex;
+  height: 20px;
+  width: 38px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #d1d9e8, #c5d2e7);
+  transition: background-color 220ms ease;
+}
+
+.app-incognito-toggle[data-enabled="true"] .app-incognito-track {
+  background: linear-gradient(135deg, #4f46e5, #06b6d4);
+}
+
+.app-incognito-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  height: 16px;
+  width: 16px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.28);
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.app-incognito-toggle[data-enabled="true"] .app-incognito-thumb {
+  transform: translateX(18px);
+}
+
+.app-incognito-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.app-incognito-toggle[data-enabled="true"] .app-incognito-text {
+  color: #312e81;
+}
+
+.app-surface-card {
+  border: 1px solid var(--app-border);
+  background: linear-gradient(180deg, var(--app-card), var(--app-card-soft));
+  box-shadow: var(--app-shadow-md);
+  transition: transform 220ms ease, box-shadow 220ms ease, border-color 220ms ease;
+}
+
+.app-surface-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--app-border-strong);
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.18);
+}
+
+.app-drag-pill {
+  border: 1px solid #c8d5ea;
+  background: linear-gradient(180deg, #f9fbff, #eef3fb);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.app-btn {
+  border-radius: 10px;
+  font-weight: 700;
+  transition: transform 150ms ease, box-shadow 180ms ease, background-color 180ms ease, border-color 180ms ease;
+}
+
+.app-btn:hover {
+  transform: translateY(-1px);
+}
+
+.app-btn:active {
+  transform: translateY(0);
+}
+
+.app-btn-primary {
+  border: 1px solid #1f5ddb;
+  background: linear-gradient(135deg, #2b6cff, #2563eb 55%, #1d4ed8);
+  color: #ffffff;
+  box-shadow: 0 10px 20px rgba(37, 99, 235, 0.24);
+}
+
+.app-btn-primary:hover {
+  box-shadow: 0 14px 24px rgba(37, 99, 235, 0.32);
+}
+
+.app-btn-secondary {
+  border: 1px solid #c8d5ea;
+  background: linear-gradient(180deg, #ffffff, #f5f8fe);
+  color: #334155;
+}
+
+.app-btn-danger {
+  border: 1px solid #ef4444;
+  background: linear-gradient(135deg, #f87171, #ef4444 60%, #dc2626);
+  color: #fff;
+  box-shadow: 0 10px 20px rgba(239, 68, 68, 0.22);
+}
+
+.app-btn-danger:hover {
+  box-shadow: 0 14px 24px rgba(239, 68, 68, 0.3);
+}
+
+.app-list-row {
+  border: 1px solid transparent;
+  transition: background-color 180ms ease, border-color 180ms ease, transform 180ms ease;
+}
+
+.app-list-row:hover {
+  border-color: #d7e3f7;
+  background: #f8fbff;
+  transform: translateX(2px);
+}
+
+.queue-command-bar {
+  animation: appSlideDown 300ms cubic-bezier(0.2, 0.9, 0.2, 1);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow:
+    0 8px 24px rgba(15, 23, 42, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+.queue-command-bar.queue-command-bar--light {
+  border-color: rgba(148, 163, 184, 0.45);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(238, 244, 252, 0.92));
+  box-shadow:
+    0 10px 26px rgba(15, 23, 42, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.75);
+}
+
+.meeting-mode-shell {
+  animation: appScaleFade 280ms cubic-bezier(0.2, 0.85, 0.2, 1);
+}
+
+.meeting-mode-start {
+  border: 1px solid #cddbf1;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 250, 255, 0.96));
+  box-shadow: 0 18px 38px rgba(15, 23, 42, 0.16);
+}
+
+.meeting-mode-live {
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  background:
+    radial-gradient(120% 120% at 0% 0%, rgba(14, 165, 233, 0.22), transparent 42%),
+    radial-gradient(120% 120% at 100% 100%, rgba(37, 99, 235, 0.24), transparent 45%),
+    rgba(15, 23, 42, 0.62);
+  box-shadow: 0 22px 48px rgba(2, 6, 23, 0.45);
+}
+
+.meeting-overlay-page .meeting-mode-start {
+  border-color: rgba(191, 219, 254, 0.52);
+  background:
+    radial-gradient(130% 130% at 0% 0%, rgba(56, 189, 248, 0.17), transparent 45%),
+    radial-gradient(130% 130% at 100% 100%, rgba(129, 140, 248, 0.18), transparent 44%),
+    rgba(241, 245, 255, 0.32);
+  box-shadow:
+    0 18px 38px rgba(15, 23, 42, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.48);
+  backdrop-filter: blur(16px) saturate(135%);
+  -webkit-backdrop-filter: blur(16px) saturate(135%);
+}
+
+.meeting-overlay-page .meeting-mode-live {
+  border-color: rgba(219, 234, 254, 0.42);
+  background:
+    radial-gradient(130% 130% at 0% 0%, rgba(14, 165, 233, 0.18), transparent 40%),
+    radial-gradient(130% 130% at 100% 100%, rgba(99, 102, 241, 0.2), transparent 42%),
+    rgba(15, 23, 42, 0.36);
+  box-shadow:
+    0 18px 38px rgba(15, 23, 42, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  backdrop-filter: blur(16px) saturate(130%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%);
+}
+
+.meeting-overlay-page .meeting-mode-live h3,
+.meeting-overlay-page .meeting-mode-live p {
+  color: rgba(241, 245, 249, 0.95);
+}
+
+.meeting-section {
+  border: 1px solid #d2dded;
+  background: #f8fbff;
+}
+
+.meeting-overlay-page .meeting-section {
+  border-color: rgba(191, 219, 254, 0.42);
+  background: rgba(248, 251, 255, 0.46);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+}
+
+.meeting-overlay-page .meeting-scroll-panel {
+  border-color: rgba(191, 219, 254, 0.32);
+  background: rgba(15, 23, 42, 0.34);
+}
+
+.meeting-scroll-panel {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 10px 24px rgba(15, 23, 42, 0.14);
+}
+
+.meeting-overlay-page .meeting-scroll-panel {
+  backdrop-filter: blur(10px) saturate(130%);
+  -webkit-backdrop-filter: blur(10px) saturate(130%);
+}
+
+.app-anim-rise {
+  animation: appRise 340ms cubic-bezier(0.2, 0.85, 0.2, 1);
+}
+
+@keyframes appPageIn {
+  from {
+    opacity: 0;
+    transform: scale(0.994);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes appScaleFade {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.992);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes appSlideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes appRise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes appIncognitoSweep {
+  from {
+    transform: translateX(-115%);
+    opacity: 0;
+  }
+  35% {
+    opacity: 1;
+  }
+  to {
+    transform: translateX(115%);
+    opacity: 0;
+  }
 }
 
 /* Liquid Glass Effect Base */
@@ -227,4 +802,29 @@ button, input, select, textarea, .interactive {
 .window-resize-grip:hover::before,
 .window-resize-grip-active::before {
   opacity: 1;
+}
+
+@media (max-width: 900px) {
+  .app-global-nav-row {
+    grid-template-columns: 1fr;
+  }
+
+  .app-global-tabs {
+    justify-self: start;
+    flex-wrap: wrap;
+  }
+
+  .app-global-actions {
+    justify-self: start;
+  }
+
+  .app-page-shell {
+    background:
+      radial-gradient(700px 380px at 10% 0%, rgba(37, 99, 235, 0.12), transparent 65%),
+      linear-gradient(180deg, #f4f8ff, #eaf1ff);
+  }
+
+  .app-window-shell {
+    border-radius: 16px;
+  }
 }
