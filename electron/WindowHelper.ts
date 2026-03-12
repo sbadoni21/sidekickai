@@ -49,24 +49,42 @@ export class WindowHelper {
     this.appState = appState
   }
 
+  private safeApplyWindowFlag(action: () => void, label: string): void {
+    try {
+      action()
+    } catch (error) {
+      console.error(`Failed to apply incognito window flag: ${label}`, error)
+    }
+  }
+
   public applyIncognitoWindowMode(enabled: boolean): void {
     if (!this.mainWindow || this.mainWindow.isDestroyed()) return
 
     // Incognito ON: stealth overlay behavior (always-on-top + capture protected).
     // Incognito OFF: normal window behavior (capturable, not forced on top).
-    this.mainWindow.setContentProtection(enabled)
-    this.mainWindow.setSkipTaskbar(enabled)
+    this.safeApplyWindowFlag(() => this.mainWindow?.setContentProtection(enabled), "setContentProtection")
+    this.safeApplyWindowFlag(() => this.mainWindow?.setSkipTaskbar(enabled), "setSkipTaskbar")
 
     if (process.platform === "darwin") {
-      this.mainWindow.setVisibleOnAllWorkspaces(enabled, {
-        visibleOnFullScreen: enabled
-      })
-      this.mainWindow.setHiddenInMissionControl(enabled)
-      this.mainWindow.setAlwaysOnTop(enabled, enabled ? "floating" : "normal")
+      this.safeApplyWindowFlag(
+        () =>
+          this.mainWindow?.setVisibleOnAllWorkspaces(enabled, {
+            visibleOnFullScreen: enabled
+          }),
+        "setVisibleOnAllWorkspaces"
+      )
+      this.safeApplyWindowFlag(
+        () => this.mainWindow?.setHiddenInMissionControl(enabled),
+        "setHiddenInMissionControl"
+      )
+      this.safeApplyWindowFlag(
+        () => this.mainWindow?.setAlwaysOnTop(enabled, enabled ? "floating" : "normal"),
+        "setAlwaysOnTop:darwin"
+      )
       return
     }
 
-    this.mainWindow.setAlwaysOnTop(enabled)
+    this.safeApplyWindowFlag(() => this.mainWindow?.setAlwaysOnTop(enabled), "setAlwaysOnTop")
   }
 
   public setWindowDimensions(width: number, height: number): void {

@@ -276,7 +276,7 @@ const App: React.FC = () => {
   }, [isWindowResizing, electronAPI])
 
   useEffect(() => {
-    if (!currentUser || !electronAPI?.getIncognitoMode || !electronAPI?.onIncognitoModeChanged) {
+    if (!electronAPI?.getIncognitoMode || !electronAPI?.onIncognitoModeChanged) {
       return
     }
 
@@ -304,7 +304,7 @@ const App: React.FC = () => {
       mounted = false
       unsubscribe?.()
     }
-  }, [currentUser, electronAPI])
+  }, [electronAPI])
 
   useEffect(() => {
     if (!hasLoadedIncognitoRef.current) return
@@ -376,13 +376,17 @@ const App: React.FC = () => {
   const isMeetingOverlayView = view === "queue" && queueMode === "meeting"
 
   const handleToggleIncognitoMode = async () => {
-    if (!electronAPI?.toggleIncognitoMode || isIncognitoBusy) return
+    if (!electronAPI?.setIncognitoMode || isIncognitoBusy) return
+    const previous = isIncognitoMode
+    const next = !previous
     setIsIncognitoBusy(true)
+    setIsIncognitoMode(next)
     try {
-      const result = await electronAPI.toggleIncognitoMode()
+      const result = await electronAPI.setIncognitoMode(next)
       setIsIncognitoMode(Boolean(result?.enabled))
     } catch (error) {
       console.error("Failed to toggle incognito mode:", error)
+      setIsIncognitoMode(previous)
     } finally {
       setIsIncognitoBusy(false)
     }

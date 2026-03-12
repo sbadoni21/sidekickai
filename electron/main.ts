@@ -532,10 +532,6 @@ export type {
 // Application initialization
 async function initializeApp() {
   applyRuntimeSecretsToEnv()
-  const appState = AppState.getInstance()
-
-  // Initialize IPC handlers before window creation
-  initializeIpcHandlers(appState)
 
   // Keep Chromium verbose logging opt-in to avoid noisy terminal output in normal runs.
   if (process.env.ELECTRON_VERBOSE_LOGGING === "1") {
@@ -543,13 +539,19 @@ async function initializeApp() {
     app.commandLine.appendSwitch("v", "1")
   }
 
-  app.whenReady().then(() => {
-    console.log("App is ready")
-    appState.createWindow()
-    appState.createTray()
-    // Register global shortcuts using ShortcutsHelper
-    appState.shortcutsHelper.registerGlobalShortcuts()
-  })
+  app.commandLine.appendSwitch("disable-background-timer-throttling")
+  await app.whenReady()
+
+  const appState = AppState.getInstance()
+
+  // Initialize IPC handlers before window creation
+  initializeIpcHandlers(appState)
+
+  console.log("App is ready")
+  appState.createWindow()
+  appState.createTray()
+  // Register global shortcuts using ShortcutsHelper
+  appState.shortcutsHelper.registerGlobalShortcuts()
 
   app.on("activate", () => {
     console.log("App activated")
@@ -566,7 +568,6 @@ async function initializeApp() {
   })
 
   app.dock?.hide() // Hide dock icon (optional)
-  app.commandLine.appendSwitch("disable-background-timer-throttling")
 }
 
 // Start the application

@@ -102,38 +102,76 @@ Default behavior:
     }
   }
 
+  private isGroqRateLimit(status: number, message: string): boolean {
+    return status === 429 || /rate limit|tokens per minute|requests per minute|try again in/i.test(message)
+  }
+
+  private parseGroqRetryAfterMs(message: string): number | null {
+    const match = message.match(/try again in\s*([\d.]+)\s*(ms|s|sec|secs|second|seconds)/i)
+    if (!match) return null
+
+    const value = Number(match[1])
+    if (!Number.isFinite(value) || value < 0) return null
+
+    const unit = match[2].toLowerCase()
+    if (unit === "ms") return Math.ceil(value)
+    return Math.ceil(value * 1000)
+  }
+
+  private getGroqRetryDelayMs(message: string, attempt: number): number {
+    const hintedDelayMs = this.parseGroqRetryAfterMs(message)
+    const fallbackDelayMs = Math.min(8000, 500 * 2 ** attempt)
+    const baseDelayMs = hintedDelayMs ?? fallbackDelayMs
+    const jitterMs = 120 + Math.floor(Math.random() * 180)
+    return Math.min(10000, baseDelayMs + jitterMs)
+  }
+
   private async callGroq(
     messages: GroqMessage[],
     options?: {
       model?: string
       temperature?: number
+      maxRetries?: number
     }
   ): Promise<string> {
     const model = options?.model || this.groqModel
     const temperature = options?.temperature ?? 0.3
+    const maxRetries = Math.max(0, options?.maxRetries ?? 3)
 
-    const response = await fetch(`${this.groqBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: this.buildGroqHeaders(),
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      const response = await fetch(`${this.groqBaseUrl}/chat/completions`, {
+        method: "POST",
+        headers: this.buildGroqHeaders(),
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature
+        })
       })
-    })
 
-    const body = (await response.json()) as GroqChatResponse
-    if (!response.ok) {
-      const message = body?.error?.message || `Groq API error: ${response.status}`
-      throw new Error(message)
+      const body = (await response.json()) as GroqChatResponse
+      if (!response.ok) {
+        const message = body?.error?.message || `Groq API error: ${response.status}`
+        if (attempt < maxRetries && this.isGroqRateLimit(response.status, message)) {
+          const retryDelayMs = this.getGroqRetryDelayMs(message, attempt)
+          console.warn(
+            `[LLMHelper] Groq rate limit hit for ${model}. Retrying in ${retryDelayMs}ms (${attempt + 1}/${maxRetries + 1}).`
+          )
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+          continue
+        }
+        throw new Error(message)
+      }
+
+      const content = body?.choices?.[0]?.message?.content
+      if (!content) {
+        throw new Error("Empty response from Groq")
+      }
+
+      return content
     }
 
-    const content = body?.choices?.[0]?.message?.content
-    if (!content) {
-      throw new Error("Empty response from Groq")
-    }
-
-    return content
+    throw new Error(`Groq API error: exhausted retries for ${model}`)
   }
 
   private async callGroqTextPrompt(prompt: string): Promise<string> {

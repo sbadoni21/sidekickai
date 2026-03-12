@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { MessageSquare, Mic, MicOff, Pause, Play, Terminal, X } from "lucide-react";
-import { cleanLLMResponse } from "../../utils/lmResponseParser";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { dracula } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { cleanLLMResponse, parseLLMResponse } from "../../utils/lmResponseParser";
 import { getCurrentUser } from "../../lib/authStore";
 import {
   DEFAULT_KNOWLEDGE_FOLDER_ID,
@@ -9,10 +11,9 @@ import {
   UserResources
 } from "../../lib/resourcesStore";
 import {
+  estimateAnswerQuality,
   generateFastDraftAnswer,
-  generateRefinedAnswer,
-  judgeAnswerQuality,
-  parseAnswerEnvelope
+  generateRefinedAnswer
 } from "../../lib/meetingAI/answerEngine";
 import {
   buildHeuristicQuestionCandidate,
@@ -21,6 +22,24 @@ import {
   getQuestionDetectionThreshold,
   normalizeQuestionSignature
 } from "../../lib/meetingAI/questionDetection";
+import {
+  buildProblemMemoryContext,
+  buildProblemMemoryPatchFromCandidate,
+  buildScreenProblemExtractionPrompt,
+  inferCodingIntent,
+  inferFrameworkFromText,
+  inferLanguageFromText,
+  isCodeHeavyIntent,
+  mergeProblemMemory,
+  normalizeFrameworkLabel,
+  normalizeLanguageLabel,
+  parseScreenProblemAnalysis
+} from "../../lib/meetingAI/problemMemory";
+import type {
+  AnswerResponseMetadata,
+  CodingIntent,
+  ProblemMemory
+} from "../../lib/meetingAI/types";
 import { buildHybridResourceContext } from "../../lib/meetingAI/ragContext";
 import type {
   AnswerAnalytics,
@@ -114,6 +133,10 @@ interface AnswerSuggestion {
   refineLatencyMs?: number;
   provider?: string;
   model?: string;
+  intent?: CodingIntent;
+  languageHint?: string;
+  frameworkHint?: string;
+  responseMetadata?: AnswerResponseMetadata;
   deepDives?: AnswerDeepDive[];
 }
 
@@ -134,6 +157,9 @@ interface QuestionCandidate {
   contextWindow: string;
   detectedAt: number;
   understanding: CodingQuestionUnderstanding;
+  intent?: CodingIntent;
+  languageHint?: string;
+  frameworkHint?: string;
 }
 
 interface SttStatusPayload {
@@ -176,8 +202,15 @@ const DEFAULT_RESOURCE_SCOPE_SELECTION: ResourceScopeSelection = {
 const RESOURCE_SCOPE_KEY_PREFIX = "cluely_meeting_resource_scope_v1_";
 
 type MeetingSttProviderChoice = "auto" | "elevenlabs" | "google" | "groq" | "puter";
+type AnswerCaptureMode = "auto" | "manual";
 
 const STT_PROVIDER_KEY_PREFIX = "cluely_meeting_stt_provider_v1_";
+const CONTEXTUAL_CODE_REQUEST_REGEX =
+  /^(give( me)?|show( me)?|write|send|provide|create)?\s*(a\s*)?(short\s+)?(code|example|sample|snippet|implementation|solution)\b/i;
+const CONTEXTUAL_EXPLANATION_REGEX =
+  /^(and|also|then|what about|how about|plus|one more|another|more|more details?|explain more|go deeper|elaborate)\b/i;
+const CONTEXT_DEPENDENT_QUESTION_REGEX =
+  /^(it|that|this|same|same thing|same one|the same|do it|continue|next|now|for this)\b/i;
 
 const normalizeSttProviderChoice = (value: unknown): MeetingSttProviderChoice => {
   if (
@@ -266,12 +299,18 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       return "auto";
     }
   });
+  const [answerCaptureMode, setAnswerCaptureMode] = useState<AnswerCaptureMode>("auto");
   const [cpuMode, setCpuMode] = useState<CpuMode>("balanced");
   const [chunkRateMs, setChunkRateMs] = useState<number>(1800);
   const [maxChunkQueue, setMaxChunkQueue] = useState<number>(8);
   const [answerThrottleMs, setAnswerThrottleMs] = useState<number>(1200);
   const [modelThrottleMs, setModelThrottleMs] = useState<number>(800);
   const [cloudOffload] = useState<boolean>(true);
+  const [isManualQuestionRecording, setIsManualQuestionRecording] = useState(false);
+  const [isManualQuestionProcessing, setIsManualQuestionProcessing] = useState(false);
+  const [manualQuestionPreview, setManualQuestionPreview] = useState("");
+  const [typedQuestionInput, setTypedQuestionInput] = useState("");
+  const [problemMemory, setProblemMemory] = useState<ProblemMemory | null>(null);
 
   const resolvedSttProvider = selectedSttProvider === "auto" ? envDefaultSttProvider : selectedSttProvider;
   const useStreamingStt = resolvedSttProvider === "google" || resolvedSttProvider === "elevenlabs";
@@ -299,6 +338,14 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const questionClassificationInFlightRef = useRef(false);
   const puterScriptPromiseRef = useRef<Promise<void> | null>(null);
   const puterReadyRef = useRef(false);
+  const answerCaptureModeRef = useRef<AnswerCaptureMode>("auto");
+  const lastTranscriptSignatureRef = useRef<{ signature: string; timestamp: number } | null>(null);
+  const manualQuestionRecordingRef = useRef(false);
+  const manualQuestionFinalizingRef = useRef(false);
+  const manualQuestionSegmentsRef = useRef<string[]>([]);
+  const manualQuestionFinalizeTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const manualQuestionPreviewRef = useRef("");
+  const problemMemoryRef = useRef<ProblemMemory | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -335,6 +382,30 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     setLogs((prev) => [...prev.slice(-80), log]);
     console.log(`[${level.toUpperCase()}]`, message);
   };
+
+  const updateManualQuestionPreview = (value: string) => {
+    manualQuestionPreviewRef.current = value;
+    setManualQuestionPreview(value);
+  };
+
+  const updateProblemMemory = (
+    patch: Partial<ProblemMemory> | null | undefined,
+    options?: { replace?: boolean }
+  ) => {
+    const next = options?.replace
+      ? patch
+        ? mergeProblemMemory(null, patch)
+        : null
+      : mergeProblemMemory(problemMemoryRef.current, patch);
+    problemMemoryRef.current = next;
+    setProblemMemory(next);
+    return next;
+  };
+
+  const isManualCaptureMode = () => answerCaptureModeRef.current === "manual";
+  const isManualCaptureActive = () =>
+    manualQuestionRecordingRef.current || manualQuestionFinalizingRef.current;
+  const shouldProcessLiveAudio = () => !isManualCaptureMode() || isManualCaptureActive();
 
   const getConfiguredSttProviderChain = (provider: MeetingSttProviderChoice): string[] => {
     if (provider === "auto") return [];
@@ -502,6 +573,22 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const clamp01 = (value: number) =>
     Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 
+  const addDetectedQuestionAnalytics = (candidate: QuestionCandidate) => {
+    const detectedQuestion: DetectedQuestionAnalytics = {
+      id: candidate.id,
+      question: candidate.question,
+      source: candidate.source,
+      confidence: clamp01(candidate.confidence),
+      detectedAt: candidate.detectedAt,
+      contextWindow: candidate.contextWindow,
+      understanding: candidate.understanding
+    };
+    updateAnalyticsRef((current) => ({
+      ...current,
+      detectedQuestions: [detectedQuestion, ...(current.detectedQuestions || [])].slice(0, 80)
+    }));
+  };
+
   const getControlsForCpuMode = (mode: CpuMode): MeetingPerformanceControls => {
     if (mode === "low") {
       return {
@@ -578,6 +665,29 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   }, [cpuMode]);
 
   useEffect(() => {
+    answerCaptureModeRef.current = answerCaptureMode;
+    setLiveTranscript(null);
+    setPartialTranscript(null);
+    if (answerCaptureMode !== "manual") {
+      manualQuestionRecordingRef.current = false;
+      manualQuestionFinalizingRef.current = false;
+      manualQuestionSegmentsRef.current = [];
+      setIsManualQuestionRecording(false);
+      setIsManualQuestionProcessing(false);
+      updateManualQuestionPreview("");
+    }
+    pendingDetectionRef.current = null;
+    if (questionDebounceRef.current) {
+      clearTimeout(questionDebounceRef.current);
+      questionDebounceRef.current = null;
+    }
+    if (manualQuestionFinalizeTimerRef.current) {
+      clearTimeout(manualQuestionFinalizeTimerRef.current);
+      manualQuestionFinalizeTimerRef.current = null;
+    }
+  }, [answerCaptureMode]);
+
+  useEffect(() => {
     updateAnalyticsRef((current) => ({
       ...current,
       controls: {
@@ -598,9 +708,211 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       .join("\n");
   };
 
+  const getLatestAskedTranscriptLine = (): string => {
+    const latestTranscriptQuestion = [...transcriptHistoryRef.current]
+      .reverse()
+      .find((turn) => {
+        const normalized = turn.text.replace(/\s+/g, " ").trim();
+        return normalized.length >= 4 && /[?]$/.test(normalized);
+      });
+
+    if (latestTranscriptQuestion) {
+      return `${latestTranscriptQuestion.source === "interviewer" ? "Interviewer" : "Candidate"}: ${latestTranscriptQuestion.text}`;
+    }
+
+    if (problemMemoryRef.current?.lastInterviewerAsk) {
+      return `Interviewer: ${problemMemoryRef.current.lastInterviewerAsk}`;
+    }
+
+    if (problemMemoryRef.current?.lastQuestion) {
+      return `Candidate: ${problemMemoryRef.current.lastQuestion}`;
+    }
+
+    return "";
+  };
+
+  const appendLastAskedTranscriptContext = (contextWindow: string): string => {
+    const latestAskedLine = getLatestAskedTranscriptLine();
+    if (!latestAskedLine) return contextWindow;
+    if (contextWindow.includes(latestAskedLine)) return contextWindow;
+
+    return [contextWindow, `Most recent asked transcript:\n${latestAskedLine}`]
+      .filter(Boolean)
+      .join("\n\n");
+  };
+
   const truncate = (text: string, limit: number) => {
     if (text.length <= limit) return text;
     return `${text.slice(0, limit)}...`;
+  };
+
+  const getMostRelevantQuestionAnchor = (question: string): string => {
+    const signature = normalizeQuestionSignature(question);
+    const entries = [...transcriptHistoryRef.current].reverse();
+
+    for (const entry of entries) {
+      const text = entry.text.replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      if (normalizeQuestionSignature(text) === signature) continue;
+      if (text.split(/\s+/).length < 4) continue;
+      return text;
+    }
+
+    return "";
+  };
+
+  const enrichQuestionWithContext = (
+    candidate: QuestionCandidate
+  ): QuestionCandidate => {
+    const originalQuestion = candidate.question.replace(/\s+/g, " ").trim();
+    if (!originalQuestion) return candidate;
+
+    const wordCount = originalQuestion.split(/\s+/).filter(Boolean).length;
+    const needsContext =
+      wordCount <= 4 ||
+      CONTEXTUAL_CODE_REQUEST_REGEX.test(originalQuestion) ||
+      CONTEXTUAL_EXPLANATION_REGEX.test(originalQuestion) ||
+      CONTEXT_DEPENDENT_QUESTION_REGEX.test(originalQuestion);
+
+    if (!needsContext) return candidate;
+
+    const anchor = getMostRelevantQuestionAnchor(originalQuestion);
+    if (!anchor) return candidate;
+
+    let resolvedQuestion = originalQuestion;
+    if (CONTEXTUAL_CODE_REQUEST_REGEX.test(originalQuestion)) {
+      resolvedQuestion = `Give a code example for: ${anchor}`;
+    } else if (CONTEXTUAL_EXPLANATION_REGEX.test(originalQuestion)) {
+      resolvedQuestion = `Explain in more detail: ${anchor}`;
+    } else {
+      resolvedQuestion = `${originalQuestion} about: ${anchor}`;
+    }
+
+    addLog("info", `🧠 Resolved follow-up using context: ${truncate(resolvedQuestion, 100)}`);
+
+    const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
+    return {
+      ...candidate,
+      question: resolvedQuestion,
+      contextWindow,
+      understanding: buildQuestionUnderstanding(resolvedQuestion, contextWindow)
+    };
+  };
+
+  const ensureExplicitQuestionTranscriptContext = (candidate: QuestionCandidate): QuestionCandidate => {
+    const contextWindow = appendLastAskedTranscriptContext(candidate.contextWindow);
+    if (contextWindow === candidate.contextWindow) return candidate;
+
+    return {
+      ...candidate,
+      contextWindow,
+      understanding: buildQuestionUnderstanding(candidate.question, contextWindow)
+    };
+  };
+
+  const resolveCandidateLanguage = (candidate: QuestionCandidate): string | undefined =>
+    normalizeLanguageLabel(
+      candidate.languageHint ||
+        problemMemoryRef.current?.preferredLanguage ||
+        inferLanguageFromText(
+          `${candidate.question}\n${candidate.contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`
+        )
+    );
+
+  const resolveCandidateFramework = (candidate: QuestionCandidate): string | undefined =>
+    normalizeFrameworkLabel(
+      candidate.frameworkHint ||
+        problemMemoryRef.current?.preferredFramework ||
+        inferFrameworkFromText(
+          `${candidate.question}\n${candidate.contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`
+        )
+    );
+
+  const syncProblemMemoryFromCandidate = (
+    candidate: QuestionCandidate,
+    source: ProblemMemory["source"] = "conversation"
+  ) => {
+    updateProblemMemory({
+      ...buildProblemMemoryPatchFromCandidate(candidate, source),
+      preferredLanguage: resolveCandidateLanguage(candidate),
+      preferredFramework: resolveCandidateFramework(candidate)
+    });
+  };
+
+  const syncProblemMemoryFromAnswer = (
+    candidate: QuestionCandidate,
+    metadata: AnswerResponseMetadata | undefined,
+    response: string
+  ) => {
+    const parsed = parseLLMResponse(response);
+    const activeIntent = metadata?.intent || candidate.intent || inferCodingIntent(candidate.question, candidate.contextWindow);
+    updateProblemMemory({
+      preferredLanguage: normalizeLanguageLabel(
+        resolveCandidateLanguage(candidate) || problemMemoryRef.current?.preferredLanguage || metadata?.language
+      ),
+      preferredFramework: normalizeFrameworkLabel(
+        resolveCandidateFramework(candidate) || problemMemoryRef.current?.preferredFramework || metadata?.framework
+      ),
+      currentApproach: metadata?.approach || problemMemoryRef.current?.currentApproach,
+      timeComplexity: metadata?.timeComplexity || problemMemoryRef.current?.timeComplexity,
+      spaceComplexity: metadata?.spaceComplexity || problemMemoryRef.current?.spaceComplexity,
+      edgeCases: metadata?.edgeCases || problemMemoryRef.current?.edgeCases,
+      examples: metadata?.examples || problemMemoryRef.current?.examples,
+      currentCode:
+        isCodeHeavyIntent(activeIntent) && (parsed.type === "code" || parsed.type === "structured")
+          ? parsed.content
+          : problemMemoryRef.current?.currentCode,
+      lastIntent: activeIntent,
+      updatedAt: Date.now()
+    });
+  };
+
+  const resolveCandidateForAnswer = async (
+    candidate: QuestionCandidate,
+    options?: { allowModelClassification?: boolean }
+  ): Promise<QuestionCandidate> => {
+    const enrichedCandidate = ensureExplicitQuestionTranscriptContext(enrichQuestionWithContext(candidate));
+    let resolvedCandidate: QuestionCandidate = {
+      ...enrichedCandidate,
+      intent: enrichedCandidate.intent || inferCodingIntent(enrichedCandidate.question, enrichedCandidate.contextWindow)
+    };
+
+    if (
+      options?.allowModelClassification !== false &&
+      (resolvedCandidate.intent === "other" || resolvedCandidate.confidence < 0.72)
+    ) {
+      try {
+        await maybeUseCloudOffload();
+        await applyModelThrottle();
+        const modelClassification = await classifyQuestionIntentWithModel(
+          enrichedCandidate,
+          (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+        );
+
+        resolvedCandidate = {
+          ...enrichedCandidate,
+          question: modelClassification.normalizedQuestion || enrichedCandidate.question,
+          confidence: Math.max(enrichedCandidate.confidence, modelClassification.confidence),
+          understanding: modelClassification.understanding,
+          intent: modelClassification.intent,
+          languageHint: modelClassification.languageHint,
+          frameworkHint: modelClassification.frameworkHint,
+          detectedAt: Date.now()
+        };
+      } catch (classificationError: any) {
+        addLog(
+          "warning",
+          `⚠️ Model classifier unavailable, using heuristic detection (${classificationError?.message || "unknown"}).`
+        );
+      }
+    }
+
+    return {
+      ...resolvedCandidate,
+      intent: resolvedCandidate.intent || inferCodingIntent(resolvedCandidate.question, resolvedCandidate.contextWindow),
+      languageHint: resolveCandidateLanguage(resolvedCandidate),
+      frameworkHint: resolveCandidateFramework(resolvedCandidate)
+    };
   };
 
   const buildResourceContext = async (question: string) => {
@@ -660,9 +972,32 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     "Mention pitfalls and edge cases"
   ];
 
+  const getIntentSpecificSuggestions = (intent?: CodingIntent): string[] => {
+    if (intent === "write_code" || intent === "debug_code") {
+      return ["Explain the code briefly", "Add test cases", "Show time and space complexity"];
+    }
+    if (intent === "optimize") {
+      return ["Compare old vs new complexity", "Show a shorter optimized version", "Mention tradeoffs"];
+    }
+    if (intent === "complexity") {
+      return ["Explain why that complexity holds", "Give a worst-case example", "Suggest an optimization"];
+    }
+    if (intent === "dry_run") {
+      return ["Dry run another example", "Show the state changes", "List edge cases"];
+    }
+    if (intent === "test_cases") {
+      return ["Add more edge cases", "Give expected outputs", "Mention failure cases"];
+    }
+    return [];
+  };
+
   const getExpansionSuggestions = (item: AnswerSuggestion): string[] => {
     const byKey = new Map<string, string>();
-    [...DEFAULT_EXPANSION_SUGGESTIONS, ...(item.followUps || [])].forEach((entry) => {
+    [
+      ...DEFAULT_EXPANSION_SUGGESTIONS,
+      ...getIntentSpecificSuggestions(item.responseMetadata?.intent || item.intent),
+      ...(item.followUps || [])
+    ].forEach((entry) => {
       const normalized = entry.replace(/\s+/g, " ").trim();
       if (!normalized) return;
       const key = normalized.toLowerCase();
@@ -702,8 +1037,41 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     modelLastCallAtRef.current = Date.now();
   };
 
+  const getAutoRefinementGoal = (intent?: CodingIntent): string => {
+    if (intent === "write_code") {
+      return "Tighten the code example, then add only the most important explanation, complexity, and edge case.";
+    }
+    if (intent === "debug_code") {
+      return "Emphasize the root cause, minimal fix, and one failing case the fix addresses.";
+    }
+    if (intent === "optimize") {
+      return "Highlight the optimization, compare old vs new complexity, and keep the code concise.";
+    }
+    if (intent === "complexity") {
+      return "Make the time and space complexity explicit and easy to justify.";
+    }
+    if (intent === "dry_run") {
+      return "Keep the dry run concrete and step-by-step on one clear example.";
+    }
+    if (intent === "test_cases") {
+      return "Focus on representative edge cases with expected outputs.";
+    }
+    return "Add concise detail for follow-up depth while staying interview-ready.";
+  };
+
+  const upsertAnswerAnalytics = (entry: AnswerAnalytics) => {
+    updateAnalyticsRef((current) => {
+      const next = [entry, ...(current.answers || []).filter((item) => item.id !== entry.id)].slice(0, 80);
+      return {
+        ...current,
+        answers: next
+      };
+    });
+  };
+
   const generateAnswer = async (candidate: QuestionCandidate) => {
-    const trimmed = candidate.question.trim();
+    const resolvedCandidate = await resolveCandidateForAnswer(candidate);
+    const trimmed = resolvedCandidate.question.trim();
     if (!trimmed) return;
     if (lastAnsweredRef.current === normalizeQuestionSignature(trimmed)) return;
 
@@ -735,29 +1103,30 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     const answerId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const pendingAnswer: AnswerSuggestion = {
       id: answerId,
-      questionId: candidate.id,
+      questionId: resolvedCandidate.id,
       question: trimmed,
       status: "pending",
       stage: "draft",
-      isRefining: true,
+      isRefining: false,
       createdAt: Date.now(),
-      confidence: Math.round(candidate.confidence * 100),
-      understanding: candidate.understanding
+      confidence: Math.round(resolvedCandidate.confidence * 100),
+      understanding: resolvedCandidate.understanding,
+      intent: resolvedCandidate.intent,
+      languageHint: resolvedCandidate.languageHint,
+      frameworkHint: resolvedCandidate.frameworkHint
     };
     setAnswers((prev) => [pendingAnswer, ...prev].slice(0, 24));
 
-    const upsertAnswerAnalytics = (entry: AnswerAnalytics) => {
-      updateAnalyticsRef((current) => {
-        const next = [entry, ...(current.answers || []).filter((item) => item.id !== entry.id)].slice(0, 80);
-        return {
-          ...current,
-          answers: next
-        };
-      });
-    };
-
     try {
-      const { context } = await buildResourceContext(trimmed);
+      syncProblemMemoryFromCandidate(resolvedCandidate);
+      const retrievalQuery = [
+        trimmed,
+        problemMemoryRef.current?.problemStatement,
+        problemMemoryRef.current?.currentApproach
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const { context } = await buildResourceContext(retrievalQuery);
       const user = getCurrentUser();
       const selectedFolderLabels = getSelectedFolderLabels();
 
@@ -766,24 +1135,24 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
 
       const draftStartedAt = Date.now();
       const parsedDraft = await generateFastDraftAnswer({
-        candidate,
+        candidate: resolvedCandidate,
         candidateName: user?.name || "Candidate",
         selectedFolderLabels,
         resourceContext: context,
+        problemMemory: problemMemoryRef.current,
         invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
       });
       const draftLatencyMs = Date.now() - draftStartedAt;
       const draftAnswer = cleanLLMResponse(parsedDraft.answer);
-
-      await applyModelThrottle();
-      const draftJudge = await judgeAnswerQuality({
-        candidate: {
-          ...candidate,
+      syncProblemMemoryFromAnswer(resolvedCandidate, parsedDraft.metadata, draftAnswer);
+      const draftQuality = estimateAnswerQuality(
+        {
+          ...resolvedCandidate,
           understanding: parsedDraft.understanding
         },
-        answer: draftAnswer,
-        invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
-      });
+        draftAnswer,
+        problemMemoryRef.current
+      );
 
       const config = await window.electronAPI.getCurrentLlmConfig().catch(() => ({
         provider: "groq" as const,
@@ -791,7 +1160,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         isOllama: false
       }));
 
-      const draftQualityOverall = clamp01(draftJudge.quality.overall);
+      const draftQualityOverall = clamp01(draftQuality.overall);
       setAnswers((prev) =>
         prev.map((item) =>
           item.id === answerId
@@ -800,15 +1169,18 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
                 response: draftAnswer,
                 status: "ready",
                 stage: "draft",
-                isRefining: true,
+                isRefining: false,
                 followUps: parsedDraft.followUps,
                 understanding: parsedDraft.understanding,
                 qualityOverall: draftQualityOverall,
-                qualityNotes: draftJudge.notes,
                 latencyMs: draftLatencyMs,
                 draftLatencyMs,
                 provider: config.provider,
-                model: config.model
+                model: config.model,
+                intent: resolvedCandidate.intent,
+                languageHint: resolvedCandidate.languageHint,
+                frameworkHint: resolvedCandidate.frameworkHint,
+                responseMetadata: parsedDraft.metadata
               }
             : item
         )
@@ -816,7 +1188,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
 
       upsertAnswerAnalytics({
         id: answerId,
-        questionId: candidate.id,
+        questionId: resolvedCandidate.id,
         question: trimmed,
         answer: draftAnswer,
         followUps: parsedDraft.followUps,
@@ -826,88 +1198,8 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         latencyMs: draftLatencyMs,
         draftLatencyMs,
         generationStage: "draft",
-        qualityJudgeProvider: config.provider,
-        qualityJudgeModel: config.model,
-        quality: draftJudge.quality
+        quality: draftQuality
       });
-
-      (async () => {
-        try {
-          await applyModelThrottle();
-          const refineStartedAt = Date.now();
-          const refinedAnswer = await generateRefinedAnswer({
-            candidate: {
-              ...candidate,
-              understanding: parsedDraft.understanding
-            },
-            draftAnswer,
-            suggestion: "Add concise detail for follow-up depth while staying interview-ready.",
-            resourceContext: context,
-            invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
-          });
-          const refineLatencyMs = Date.now() - refineStartedAt;
-
-          await applyModelThrottle();
-          const refinedJudge = await judgeAnswerQuality({
-            candidate: {
-              ...candidate,
-              understanding: parsedDraft.understanding
-            },
-            answer: refinedAnswer,
-            invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
-          });
-          const refinedOverall = clamp01(refinedJudge.quality.overall);
-
-          setAnswers((prev) =>
-            prev.map((item) =>
-              item.id === answerId
-                ? {
-                    ...item,
-                    response: refinedAnswer,
-                    stage: "refined",
-                    isRefining: false,
-                    qualityOverall: refinedOverall,
-                    qualityNotes: refinedJudge.notes || item.qualityNotes,
-                    refineLatencyMs,
-                    latencyMs: (item.draftLatencyMs || 0) + refineLatencyMs
-                  }
-                : item
-            )
-          );
-
-          upsertAnswerAnalytics({
-            id: answerId,
-            questionId: candidate.id,
-            question: trimmed,
-            answer: refinedAnswer,
-            followUps: parsedDraft.followUps,
-            provider: config.provider,
-            model: config.model,
-            createdAt: Date.now(),
-            latencyMs: draftLatencyMs + refineLatencyMs,
-            draftLatencyMs,
-            refineLatencyMs,
-            generationStage: "refined",
-            qualityJudgeProvider: config.provider,
-            qualityJudgeModel: config.model,
-            quality: refinedJudge.quality
-          });
-        } catch (refineError: any) {
-          const message = refineError?.message || "Refinement failed";
-          setAnswers((prev) =>
-            prev.map((item) =>
-              item.id === answerId
-                ? {
-                    ...item,
-                    isRefining: false,
-                    qualityNotes: item.qualityNotes || message
-                  }
-                : item
-            )
-          );
-          addLog("warning", `⚠️ Refinement skipped: ${message}`);
-        }
-      })().catch(() => undefined);
     } catch (err: any) {
       setAnswers((prev) =>
         prev.map((item) =>
@@ -923,6 +1215,124 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       if (pending && normalizeQuestionSignature(pending.question) !== normalizeQuestionSignature(trimmed)) {
         generateAnswer(pending);
       }
+    }
+  };
+
+  const requestAnswerRefinement = async (answerId: string) => {
+    const selectedAnswer = answers.find((item) => item.id === answerId);
+    if (!selectedAnswer || selectedAnswer.status !== "ready" || !selectedAnswer.response || selectedAnswer.isRefining) {
+      return;
+    }
+
+    const answerIntent = selectedAnswer.responseMetadata?.intent || selectedAnswer.intent || inferCodingIntent(selectedAnswer.question);
+    const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
+    const refinementCandidate: QuestionCandidate = {
+      id: selectedAnswer.questionId || `refine-${answerId}`,
+      question: selectedAnswer.question,
+      source: "user",
+      confidence: Math.max((selectedAnswer.confidence || 80) / 100, 0.6),
+      contextWindow,
+      detectedAt: Date.now(),
+      understanding:
+        selectedAnswer.understanding || buildQuestionUnderstanding(selectedAnswer.question, contextWindow),
+      intent: answerIntent,
+      languageHint: normalizeLanguageLabel(
+        selectedAnswer.responseMetadata?.language || selectedAnswer.languageHint || problemMemoryRef.current?.preferredLanguage
+      ),
+      frameworkHint: normalizeFrameworkLabel(
+        selectedAnswer.responseMetadata?.framework || selectedAnswer.frameworkHint || problemMemoryRef.current?.preferredFramework
+      )
+    };
+
+    setAnswers((prev) =>
+      prev.map((item) =>
+        item.id === answerId
+          ? {
+              ...item,
+              isRefining: true
+            }
+          : item
+      )
+    );
+
+    try {
+      await maybeUseCloudOffload();
+      const retrievalQuery = [
+        selectedAnswer.question,
+        selectedAnswer.responseMetadata?.approach,
+        problemMemoryRef.current?.problemStatement
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const { context } = await buildResourceContext(retrievalQuery);
+
+      await applyModelThrottle();
+      const refineStartedAt = Date.now();
+      const refinedAnswer = await generateRefinedAnswer({
+        candidate: refinementCandidate,
+        draftAnswer: selectedAnswer.response,
+        suggestion: getAutoRefinementGoal(answerIntent),
+        resourceContext: context,
+        problemMemory: problemMemoryRef.current,
+        invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+      });
+      const refineLatencyMs = Date.now() - refineStartedAt;
+      syncProblemMemoryFromAnswer(refinementCandidate, selectedAnswer.responseMetadata, refinedAnswer);
+      const refinedQuality = estimateAnswerQuality(refinementCandidate, refinedAnswer, problemMemoryRef.current);
+      const refinedOverall = clamp01(refinedQuality.overall);
+
+      const config = await window.electronAPI.getCurrentLlmConfig().catch(() => ({
+        provider: "groq" as const,
+        model: "unknown",
+        isOllama: false
+      }));
+
+      setAnswers((prev) =>
+        prev.map((item) =>
+          item.id === answerId
+            ? {
+                ...item,
+                response: refinedAnswer,
+                stage: "refined",
+                isRefining: false,
+                qualityOverall: refinedOverall,
+                refineLatencyMs,
+                latencyMs: (item.draftLatencyMs || item.latencyMs || 0) + refineLatencyMs,
+                provider: config.provider,
+                model: config.model
+              }
+            : item
+        )
+      );
+
+      upsertAnswerAnalytics({
+        id: answerId,
+        questionId: selectedAnswer.questionId,
+        question: selectedAnswer.question,
+        answer: refinedAnswer,
+        followUps: selectedAnswer.followUps || [],
+        provider: config.provider,
+        model: config.model,
+        createdAt: Date.now(),
+        latencyMs: (selectedAnswer.draftLatencyMs || selectedAnswer.latencyMs || 0) + refineLatencyMs,
+        draftLatencyMs: selectedAnswer.draftLatencyMs,
+        refineLatencyMs,
+        generationStage: "refined",
+        quality: refinedQuality
+      });
+    } catch (error: any) {
+      const message = error?.message || "Failed to refine answer.";
+      setAnswers((prev) =>
+        prev.map((item) =>
+          item.id === answerId
+            ? {
+                ...item,
+                isRefining: false
+              }
+            : item
+        )
+      );
+      addLog("warning", `⚠️ Manual refine failed: ${message}`);
     }
   };
 
@@ -956,12 +1366,22 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       await maybeUseCloudOffload();
       await applyModelThrottle();
 
-      const contextWindow = buildConversationContext(8);
+      const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
       const { context } = await buildResourceContext(`${selectedAnswer.question} ${normalizedSuggestion}`);
+      const answerIntent = selectedAnswer.responseMetadata?.intent || selectedAnswer.intent || inferCodingIntent(selectedAnswer.question);
+      const preferredLanguage = normalizeLanguageLabel(
+        selectedAnswer.responseMetadata?.language || selectedAnswer.languageHint || problemMemoryRef.current?.preferredLanguage
+      );
+      const preferredFramework = normalizeFrameworkLabel(
+        selectedAnswer.responseMetadata?.framework || selectedAnswer.frameworkHint || problemMemoryRef.current?.preferredFramework
+      );
       const prompt = `You are an interview copilot.
 
 Original interview question:
 ${selectedAnswer.question}
+
+Detected intent:
+${answerIntent}
 
 Current answer:
 ${selectedAnswer.response}
@@ -972,11 +1392,20 @@ ${normalizedSuggestion}
 Recent conversation context:
 ${contextWindow || "No recent context."}
 
+Active problem memory:
+${buildProblemMemoryContext(problemMemoryRef.current) || "None"}
+
+Preferred language:
+${preferredLanguage || "unspecified"}
+
+Preferred framework:
+${preferredFramework || "unspecified"}
+
 Candidate resources:
 ${context || "No resources provided."}
 
 Return plain text only. Keep it concise, interview-ready, and actionable.
-If coding-related, include quick complexity and one edge case.`;
+If coding-related, preserve the original language and framework and include quick complexity and one edge case.`;
 
       const raw = await window.electronAPI.invoke("llm-chat", prompt);
       const expanded = cleanLLMResponse(coerceLlmResponseText(raw));
@@ -1015,31 +1444,7 @@ If coding-related, include quick complexity and one edge case.`;
     if (isScreenAnswering) return;
     setIsScreenAnswering(true);
 
-    const screenQuestion = "Answer what is currently visible on screen";
-    const contextWindow = buildConversationContext(8);
-    const fallbackCandidate: QuestionCandidate = {
-      id: `screen-${Date.now()}`,
-      question: screenQuestion,
-      source: "user",
-      confidence: 0.92,
-      contextWindow,
-      detectedAt: Date.now(),
-      understanding: buildQuestionUnderstanding(screenQuestion, contextWindow)
-    };
-
-    const answerId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const pendingScreenAnswer: AnswerSuggestion = {
-      id: answerId,
-      questionId: fallbackCandidate.id,
-      question: screenQuestion,
-      status: "pending",
-      createdAt: Date.now(),
-      confidence: 100,
-      understanding: fallbackCandidate.understanding
-    };
-    setAnswers((prev) =>
-      [pendingScreenAnswer, ...prev].slice(0, 24)
-    );
+    const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
 
     try {
       await maybeUseCloudOffload();
@@ -1058,111 +1463,97 @@ If coding-related, include quick complexity and one edge case.`;
         throw new Error("Screen analysis returned no text.");
       }
 
-      const { context } = await buildResourceContext(`${screenQuestion} ${screenSummary}`);
-      const selectedFolderLabels = getSelectedFolderLabels();
-      const prompt = `You are an interview copilot for coding interviews.
-
-Task: The user clicked "Answer from screen". Use the analyzed screen content plus context to provide the most likely interview-ready answer.
-
-Screen analysis:
-${screenSummary}
-
-Recent conversation context:
-${contextWindow || "No recent context."}
-
-Selected resource folders:
-${selectedFolderLabels.join(", ") || "None"}
-
-Candidate resources:
-${context || "No resources provided."}
-
-Return STRICT JSON only (no markdown):
-{
-  "answer": "one concise interview-ready response under 140 words",
-  "follow_ups": ["optional short bullet 1", "optional short bullet 2"],
-  "question_understanding": {
-    "problem_statement": "normalized prompt",
-    "constraints": ["constraint 1"],
-    "edge_cases": ["edge case 1"]
-  },
-  "quality": {
-    "clarity": 0.0,
-    "correctness": 0.0,
-    "concision": 0.0,
-    "relevance": 0.0,
-    "overall": 0.0
-  }
-}`;
-
       await applyModelThrottle();
-      const startedAt = Date.now();
-      const [response, config] = await Promise.all([
-        window.electronAPI.invoke("llm-chat", prompt),
-        window.electronAPI.getCurrentLlmConfig().catch(() => ({
-          provider: "groq" as const,
-          model: "unknown",
-          isOllama: false
-        }))
-      ]);
-      const latencyMs = Date.now() - startedAt;
-      const parsed = parseAnswerEnvelope(coerceLlmResponseText(response), fallbackCandidate);
-      const cleaned = cleanLLMResponse(parsed.answer);
-      await applyModelThrottle();
-      const judged = await judgeAnswerQuality({
-        candidate: {
-          ...fallbackCandidate,
-          understanding: parsed.understanding
-        },
-        answer: cleaned,
-        invokeLlm: (judgePrompt) => window.electronAPI.invoke("llm-chat", judgePrompt)
-      });
-      const judgedOverall = clamp01(judged.quality.overall);
-
-      const answerAnalytics: AnswerAnalytics = {
-        id: answerId,
-        questionId: fallbackCandidate.id,
-        question: screenQuestion,
-        answer: cleaned,
-        followUps: parsed.followUps,
-        provider: config.provider,
-        model: config.model,
-        createdAt: Date.now(),
-        latencyMs,
-        qualityJudgeProvider: config.provider,
-        qualityJudgeModel: config.model,
-        quality: judged.quality
-      };
-      updateAnalyticsRef((current) => ({
-        ...current,
-        answers: [answerAnalytics, ...(current.answers || [])].slice(0, 80)
-      }));
-
-      setAnswers((prev) =>
-        prev.map((item) =>
-          item.id === answerId
-            ? {
-                ...item,
-                status: "ready",
-                response: cleaned,
-                followUps: parsed.followUps,
-                understanding: parsed.understanding,
-                qualityOverall: judgedOverall,
-                qualityNotes: judged.notes,
-                latencyMs,
-                provider: config.provider,
-                model: config.model
-              }
-            : item
-        )
+      const extractionRaw = await window.electronAPI.invoke(
+        "llm-chat",
+        buildScreenProblemExtractionPrompt(screenSummary, contextWindow, problemMemoryRef.current)
       );
+      const extracted = parseScreenProblemAnalysis(coerceLlmResponseText(extractionRaw), {
+        activeRequest: "Help me solve the visible coding problem",
+        intent: inferCodingIntent(screenSummary, contextWindow),
+        problemStatement: problemMemoryRef.current?.problemStatement || screenSummary,
+        preferredLanguage: inferLanguageFromText(
+          `${screenSummary}\n${problemMemoryRef.current?.preferredLanguage || ""}`
+        ),
+        preferredFramework: inferFrameworkFromText(
+          `${screenSummary}\n${problemMemoryRef.current?.preferredFramework || ""}`
+        ),
+        constraints: problemMemoryRef.current?.constraints || [],
+        edgeCases: problemMemoryRef.current?.edgeCases || [],
+        examples: problemMemoryRef.current?.examples || []
+      });
+
+      const inferredIntent =
+        extracted.intent === "other"
+          ? inferCodingIntent(extracted.activeRequest || extracted.problemStatement, screenSummary)
+          : extracted.intent;
+      const languageHint = normalizeLanguageLabel(
+        extracted.preferredLanguage || problemMemoryRef.current?.preferredLanguage
+      );
+      const frameworkHint = normalizeFrameworkLabel(
+        extracted.preferredFramework || problemMemoryRef.current?.preferredFramework
+      );
+      const fallbackQuestion =
+        inferredIntent === "debug_code"
+          ? "Debug the visible code"
+          : inferredIntent === "optimize"
+          ? "Optimize the visible solution"
+          : inferredIntent === "complexity"
+          ? "Explain the complexity of the visible solution"
+          : inferredIntent === "dry_run"
+          ? "Dry run the visible solution"
+          : inferredIntent === "test_cases"
+          ? "Give test cases for the visible problem"
+          : `Write ${frameworkHint ? `${frameworkHint} ` : ""}${languageHint ? `${languageHint} ` : ""}code for the visible problem`;
+
+      updateProblemMemory({
+        problemStatement: extracted.problemStatement || problemMemoryRef.current?.problemStatement || fallbackQuestion,
+        constraints: extracted.constraints,
+        edgeCases: extracted.edgeCases,
+        examples: extracted.examples,
+        preferredLanguage: languageHint,
+        preferredFramework: frameworkHint,
+        currentCode: extracted.visibleCode,
+        currentApproach: extracted.currentApproach,
+        timeComplexity: extracted.timeComplexity,
+        spaceComplexity: extracted.spaceComplexity,
+        screenSummary,
+        lastIntent: inferredIntent,
+        lastQuestion: extracted.activeRequest || fallbackQuestion,
+        source: "screen",
+        updatedAt: Date.now()
+      });
+
+      const screenCandidate: QuestionCandidate = {
+        id: `screen-${Date.now()}`,
+        question: extracted.activeRequest || fallbackQuestion,
+        source: "user",
+        confidence: 0.96,
+        contextWindow,
+        detectedAt: Date.now(),
+        understanding: {
+          problemStatement:
+            extracted.problemStatement || buildQuestionUnderstanding(fallbackQuestion, contextWindow).problemStatement,
+          constraints: extracted.constraints,
+          edgeCases: extracted.edgeCases
+        },
+        intent: inferredIntent,
+        languageHint,
+        frameworkHint
+      };
+
+      addDetectedQuestionAnalytics(screenCandidate);
+      addLog(
+        "info",
+        `🖼️ Screen context loaded: ${truncate(
+          extracted.problemStatement || extracted.activeRequest || fallbackQuestion,
+          90
+        )}`
+      );
+      await generateAnswer(screenCandidate);
       addLog("success", "🖼️ Screen analyzed and answer generated.");
     } catch (error: any) {
       const message = error?.message || "Failed to answer from screen.";
-      setAnswers((prev) =>
-        prev.map((item) =>
-          item.id === answerId ? { ...item, status: "error", error: message } : item
-        )
-      );
       addLog("error", `❌ Screen answer failed: ${message}`);
     } finally {
       setIsScreenAnswering(false);
@@ -1170,6 +1561,169 @@ Return STRICT JSON only (no markdown):
   };
 
   const formatSourceLabel = (source: MeetingAudioSource) => (source === "interviewer" ? "Interviewer" : "You");
+
+  const formatIntentLabel = (intent?: CodingIntent): string => {
+    if (!intent) return "General";
+    return intent
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, (match) => match.toUpperCase());
+  };
+
+  const toSyntaxLanguage = (languageHint?: string, frameworkHint?: string): string => {
+    const normalized = String(languageHint || "").trim().toLowerCase();
+    const framework = String(frameworkHint || "").trim().toLowerCase();
+    const jsxFramework =
+      framework === "react" ||
+      framework === "next.js" ||
+      framework === "remix" ||
+      framework === "solidjs" ||
+      framework === "preact" ||
+      framework === "react native" ||
+      framework === "expo";
+
+    if (framework === "vue" || framework === "nuxt" || framework === "svelte" || framework === "sveltekit") {
+      return "html";
+    }
+    if (framework === "astro") return "astro";
+
+    if (!normalized && jsxFramework) return "jsx";
+    if (normalized === "typescript") return jsxFramework ? "tsx" : "typescript";
+    if (normalized === "javascript" && jsxFramework) return "jsx";
+    if (normalized === "javascript") return "javascript";
+    if (normalized === "python") return "python";
+    if (normalized === "kotlin") return "kotlin";
+    if (normalized === "swift") return "swift";
+    if (normalized === "php") return "php";
+    if (normalized === "ruby") return "ruby";
+    if (normalized === "scala") return "scala";
+    if (normalized === "dart") return "dart";
+    if (normalized === "sql") return "sql";
+    if (normalized === "java") return "java";
+    if (normalized === "c++") return "cpp";
+    if (normalized === "c#") return "csharp";
+    if (normalized === "go") return "go";
+    if (normalized === "rust") return "rust";
+    return normalized || "javascript";
+  };
+
+  const extractCodeBlock = (content: string) => {
+    const match = content.match(/```(\w+)?\n([\s\S]+?)```/);
+    if (!match || typeof match.index !== "number") return null;
+    return {
+      language: match[1] || "",
+      code: match[2].trim(),
+      before: content.slice(0, match.index).trim(),
+      after: content.slice(match.index + match[0].length).trim()
+    };
+  };
+
+  const copyToClipboard = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      addLog("success", `📋 Copied ${label}`);
+    } catch (error: any) {
+      addLog("error", `❌ Failed to copy ${label}: ${error?.message || "unknown error"}`);
+    }
+  };
+
+  const renderAnswerContent = (item: AnswerSuggestion) => {
+    if (!item.response) return null;
+
+    const extracted = extractCodeBlock(item.response);
+    if (extracted) {
+      return (
+        <div className="meeting-answer-rendered space-y-2">
+          {extracted.before && (
+            <div className="meeting-answer-response whitespace-pre-wrap text-sm">{extracted.before}</div>
+          )}
+          <div className="meeting-answer-code-shell">
+            <div className="meeting-answer-code-toolbar">
+              <span className="meeting-answer-code-label">
+                {normalizeLanguageLabel(extracted.language || item.responseMetadata?.language) || "Code"}
+              </span>
+              <button
+                type="button"
+                onClick={() => copyToClipboard(extracted.code, "code")}
+                className="meeting-answer-copy-button"
+              >
+                Copy
+              </button>
+            </div>
+            <SyntaxHighlighter
+              language={toSyntaxLanguage(
+                extracted.language || item.responseMetadata?.language || item.languageHint,
+                item.responseMetadata?.framework || item.frameworkHint
+              )}
+              style={dracula}
+              customStyle={{
+                margin: 0,
+                padding: "0.85rem",
+                borderRadius: "0.8rem",
+                fontSize: "0.75rem",
+                lineHeight: "1.55",
+                background: "rgba(2, 6, 23, 0.92)"
+              }}
+              showLineNumbers
+              wrapLongLines
+            >
+              {extracted.code}
+            </SyntaxHighlighter>
+          </div>
+          {extracted.after && (
+            <div className="meeting-answer-response whitespace-pre-wrap text-sm">{extracted.after}</div>
+          )}
+        </div>
+      );
+    }
+
+    const parsed = parseLLMResponse(item.response);
+    if (parsed.type === "code" || parsed.type === "structured") {
+      return (
+        <div className="meeting-answer-rendered space-y-2">
+          <div className="meeting-answer-code-shell">
+            <div className="meeting-answer-code-toolbar">
+              <span className="meeting-answer-code-label">
+                {normalizeLanguageLabel(parsed.language || item.responseMetadata?.language) || "Code"}
+              </span>
+              <button
+                type="button"
+                onClick={() => copyToClipboard(parsed.content, "code")}
+                className="meeting-answer-copy-button"
+              >
+                Copy
+              </button>
+            </div>
+            <SyntaxHighlighter
+              language={toSyntaxLanguage(
+                parsed.language || item.responseMetadata?.language || item.languageHint,
+                item.responseMetadata?.framework || item.frameworkHint
+              )}
+              style={dracula}
+              customStyle={{
+                margin: 0,
+                padding: "0.85rem",
+                borderRadius: "0.8rem",
+                fontSize: "0.75rem",
+                lineHeight: "1.55",
+                background: "rgba(2, 6, 23, 0.92)"
+              }}
+              showLineNumbers
+              wrapLongLines
+            >
+              {parsed.content}
+            </SyntaxHighlighter>
+          </div>
+          {parsed.metadata?.thoughts && parsed.metadata.thoughts.length > 0 && (
+            <div className="meeting-answer-response whitespace-pre-wrap text-sm">
+              {parsed.metadata.thoughts.join("\n")}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return <div className="meeting-answer-response whitespace-pre-wrap text-sm">{item.response}</div>;
+  };
 
   const toTranscriptPayload = (payload: string | LiveTranscriptPayload): LiveTranscriptPayload => {
     if (typeof payload === "string") return { text: payload, source: "user" };
@@ -1180,6 +1734,10 @@ Return STRICT JSON only (no markdown):
   };
 
   const flushDetectedQuestion = async () => {
+    if (isManualCaptureMode()) {
+      pendingDetectionRef.current = null;
+      return;
+    }
     if (questionClassificationInFlightRef.current) return;
     const pending = pendingDetectionRef.current;
     pendingDetectionRef.current = null;
@@ -1187,33 +1745,7 @@ Return STRICT JSON only (no markdown):
     questionClassificationInFlightRef.current = true;
 
     try {
-      let classifiedCandidate = pending;
-      try {
-        await maybeUseCloudOffload();
-        await applyModelThrottle();
-        const modelClassification = await classifyQuestionIntentWithModel(
-          pending,
-          (prompt) => window.electronAPI.invoke("llm-chat", prompt)
-        );
-
-        if (!modelClassification.isQuestion) {
-          addLog("info", `🧠 Ignored non-question: ${truncate(pending.question, 80)}`);
-          return;
-        }
-
-        classifiedCandidate = {
-          ...pending,
-          question: modelClassification.normalizedQuestion || pending.question,
-          confidence: Math.max(pending.confidence, modelClassification.confidence),
-          understanding: modelClassification.understanding,
-          detectedAt: Date.now()
-        };
-      } catch (classificationError: any) {
-        addLog(
-          "warning",
-          `⚠️ Model classifier unavailable, using heuristic detection (${classificationError?.message || "unknown"}).`
-        );
-      }
+      const classifiedCandidate = await resolveCandidateForAnswer(pending);
 
       const threshold = getQuestionDetectionThreshold(classifiedCandidate.question);
       if (classifiedCandidate.confidence < threshold) {
@@ -1244,26 +1776,15 @@ Return STRICT JSON only (no markdown):
       lastQuestionTimestampRef.current = now;
       addLog(
         "info",
-        `🧠 Question detected (${Math.round(classifiedCandidate.confidence * 100)}%): ${truncate(
-          classifiedCandidate.question,
-          80
-        )}`
+        `🧠 Question detected [${classifiedCandidate.intent || "other"}${
+          classifiedCandidate.languageHint ? ` | ${classifiedCandidate.languageHint}` : ""
+        }] (${Math.round(classifiedCandidate.confidence * 100)}%): ${truncate(classifiedCandidate.question, 80)}`
       );
 
-      const detectedQuestion: DetectedQuestionAnalytics = {
-        id: classifiedCandidate.id,
-        question: classifiedCandidate.question,
-        source: classifiedCandidate.source,
-        confidence: clamp01(classifiedCandidate.confidence),
-        detectedAt: classifiedCandidate.detectedAt,
-        contextWindow: classifiedCandidate.contextWindow,
-        understanding: classifiedCandidate.understanding
-      };
-      updateAnalyticsRef((current) => ({
-        ...current,
-        detectedQuestions: [detectedQuestion, ...(current.detectedQuestions || [])].slice(0, 80)
-      }));
+      addDetectedQuestionAnalytics(classifiedCandidate);
+      syncProblemMemoryFromCandidate(classifiedCandidate);
 
+      if (isManualCaptureMode()) return;
       generateAnswer(classifiedCandidate);
     } finally {
       questionClassificationInFlightRef.current = false;
@@ -1271,13 +1792,14 @@ Return STRICT JSON only (no markdown):
   };
 
   const handleTranscriptForAnswer = (payload: LiveTranscriptPayload) => {
+    if (isManualCaptureMode()) return;
     const shouldProcess = hasInterviewerAudioRef.current ? payload.source === "interviewer" : payload.source === "user";
     if (!shouldProcess) return;
 
     const candidateFromPayload = buildHeuristicQuestionCandidate(
       payload.text,
       payload.source,
-      buildConversationContext(6)
+      appendLastAskedTranscriptContext(buildConversationContext(6))
     );
     const recentMergedText = transcriptHistoryRef.current
       .slice(-4)
@@ -1285,7 +1807,11 @@ Return STRICT JSON only (no markdown):
       .join(" ")
       .trim();
     const candidateFromRecent = recentMergedText
-      ? buildHeuristicQuestionCandidate(recentMergedText, payload.source, buildConversationContext(8))
+      ? buildHeuristicQuestionCandidate(
+          recentMergedText,
+          payload.source,
+          appendLastAskedTranscriptContext(buildConversationContext(8))
+        )
       : null;
     const candidate =
       !candidateFromPayload
@@ -1304,7 +1830,7 @@ Return STRICT JSON only (no markdown):
       normalizeQuestionSignature(candidate.question) !== normalizeQuestionSignature(existing.question)
     ) {
       const mergedQuestion = `${existing.question} ${candidate.question}`.replace(/\s+/g, " ").trim();
-      const mergedContext = buildConversationContext(8);
+      const mergedContext = appendLastAskedTranscriptContext(buildConversationContext(8));
       const mergedCandidate = buildHeuristicQuestionCandidate(
         mergedQuestion,
         candidate.source,
@@ -1333,11 +1859,19 @@ Return STRICT JSON only (no markdown):
   };
 
   const appendTranscriptEntry = (transcript: LiveTranscriptPayload) => {
-    if (!transcript.text.trim()) return;
+    if (!shouldProcessLiveAudio()) return;
+    const normalizedText = transcript.text.trim();
+    if (!normalizedText) return;
     const timestamp = Date.now();
+    const signature = `${transcript.source}:${normalizedText.toLowerCase()}`;
+    const lastSignature = lastTranscriptSignatureRef.current;
+    if (lastSignature && lastSignature.signature === signature && timestamp - lastSignature.timestamp < 1400) {
+      return;
+    }
+    lastTranscriptSignatureRef.current = { signature, timestamp };
     const transcriptEntry: MeetingTranscript = {
       timestamp,
-      text: transcript.text,
+      text: normalizedText,
       source: transcript.source,
     };
     transcriptHistoryRef.current = [...transcriptHistoryRef.current, transcriptEntry].slice(-24);
@@ -1345,7 +1879,7 @@ Return STRICT JSON only (no markdown):
     const segment: TranscriptSegmentAnalytics = {
       id: `segment-${timestamp}-${Math.random().toString(16).slice(2, 8)}`,
       timestamp,
-      text: transcript.text,
+      text: normalizedText,
       source: transcript.source,
       provider: sttStatus?.provider || resolvedSttProvider || "unknown",
       latencyMs:
@@ -1359,15 +1893,20 @@ Return STRICT JSON only (no markdown):
       transcriptSegments: [segment, ...(current.transcriptSegments || [])].slice(0, 240)
     }));
 
-    addLog("success", `📄 [${formatSourceLabel(transcript.source)}] "${transcript.text}"`);
-    setLiveTranscript(transcript);
+    if (isManualCaptureActive()) {
+      manualQuestionSegmentsRef.current = [...manualQuestionSegmentsRef.current, normalizedText].slice(-12);
+      updateManualQuestionPreview(manualQuestionSegmentsRef.current.join(" ").trim());
+    }
+
+    addLog("success", `📄 [${formatSourceLabel(transcript.source)}] "${normalizedText}"`);
+    setLiveTranscript({ ...transcript, text: normalizedText });
     setPartialTranscript(null);
     setMeeting((prev) => {
       if (!prev) return null;
       return { ...prev, transcripts: [...prev.transcripts, transcriptEntry] };
     });
 
-    handleTranscriptForAnswer(transcript);
+    handleTranscriptForAnswer({ ...transcript, text: normalizedText });
   };
 
   const blobToBase64 = (blob: Blob): Promise<string> =>
@@ -1381,6 +1920,152 @@ Return STRICT JSON only (no markdown):
       reader.onerror = () => reject(new Error("Failed to read audio chunk"));
       reader.readAsDataURL(blob);
     });
+
+  const cancelManualQuestionCapture = (message?: string) => {
+    manualQuestionRecordingRef.current = false;
+    manualQuestionFinalizingRef.current = false;
+    manualQuestionSegmentsRef.current = [];
+    if (manualQuestionFinalizeTimerRef.current) {
+      clearTimeout(manualQuestionFinalizeTimerRef.current);
+      manualQuestionFinalizeTimerRef.current = null;
+    }
+    setIsManualQuestionRecording(false);
+    setIsManualQuestionProcessing(false);
+    updateManualQuestionPreview("");
+    setLiveTranscript(null);
+    setPartialTranscript(null);
+    if (message) {
+      addLog("warning", message);
+    }
+  };
+
+  const finalizeManualQuestionCapture = () => {
+    if (manualQuestionFinalizeTimerRef.current) {
+      clearTimeout(manualQuestionFinalizeTimerRef.current);
+      manualQuestionFinalizeTimerRef.current = null;
+    }
+    manualQuestionFinalizingRef.current = false;
+
+    const question =
+      manualQuestionSegmentsRef.current.join(" ").replace(/\s+/g, " ").trim() ||
+      manualQuestionPreviewRef.current.trim();
+    manualQuestionSegmentsRef.current = [];
+
+    if (!question) {
+      setIsManualQuestionProcessing(false);
+      updateManualQuestionPreview("");
+      setLiveTranscript(null);
+      setPartialTranscript(null);
+      addLog("warning", "⚠️ No question captured. Try recording again.");
+      return;
+    }
+
+    const detectedAt = Date.now();
+    const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
+    const candidate: QuestionCandidate = {
+      id: `manual-${detectedAt}`,
+      question,
+      source: "user",
+      confidence: 1,
+      contextWindow,
+      detectedAt,
+      understanding: buildQuestionUnderstanding(question, contextWindow),
+      intent: inferCodingIntent(question, contextWindow),
+      languageHint: normalizeLanguageLabel(
+        inferLanguageFromText(`${question}\n${contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`)
+      ),
+      frameworkHint: normalizeFrameworkLabel(
+        inferFrameworkFromText(`${question}\n${contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`)
+      )
+    };
+
+    lastAnsweredRef.current = null;
+    lastQuestionSignatureRef.current = normalizeQuestionSignature(question);
+    lastQuestionTimestampRef.current = detectedAt;
+    addDetectedQuestionAnalytics(candidate);
+    updateManualQuestionPreview(question);
+    setIsManualQuestionProcessing(false);
+    setLiveTranscript(null);
+    setPartialTranscript(null);
+    addLog("info", `🎙️ Manual question ready: ${truncate(question, 80)}`);
+    generateAnswer(candidate).catch((error: any) => {
+      addLog("error", `❌ Manual answer failed: ${error?.message || "unknown error"}`);
+    });
+  };
+
+  const startManualQuestionCapture = () => {
+    if (!meetingStateRef.current.isRecording || meetingStateRef.current.isPaused) {
+      setError("Resume the meeting before recording a manual question.");
+      return;
+    }
+    if (!micEnabledRef.current) {
+      setError("Turn the mic on before recording a manual question.");
+      return;
+    }
+    if (isManualQuestionProcessing || isManualQuestionRecording) return;
+
+    if (manualQuestionFinalizeTimerRef.current) {
+      clearTimeout(manualQuestionFinalizeTimerRef.current);
+      manualQuestionFinalizeTimerRef.current = null;
+    }
+    manualQuestionSegmentsRef.current = [];
+    manualQuestionRecordingRef.current = true;
+    manualQuestionFinalizingRef.current = false;
+    setIsManualQuestionRecording(true);
+    setIsManualQuestionProcessing(false);
+    updateManualQuestionPreview("");
+    setLiveTranscript(null);
+    setPartialTranscript(null);
+    setError(null);
+    addLog("info", "🎙️ Manual question capture started.");
+  };
+
+  const stopManualQuestionCapture = () => {
+    if (!manualQuestionRecordingRef.current) return;
+    manualQuestionRecordingRef.current = false;
+    manualQuestionFinalizingRef.current = true;
+    setIsManualQuestionRecording(false);
+    setIsManualQuestionProcessing(true);
+    setPartialTranscript(null);
+    manualQuestionFinalizeTimerRef.current = setTimeout(() => {
+      finalizeManualQuestionCapture();
+    }, 900);
+  };
+
+  const submitTypedQuestion = () => {
+    const question = typedQuestionInput.replace(/\s+/g, " ").trim();
+    if (!question) return;
+
+    const detectedAt = Date.now();
+    const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
+    const candidate: QuestionCandidate = {
+      id: `typed-${detectedAt}`,
+      question,
+      source: "user",
+      confidence: 1,
+      contextWindow,
+      detectedAt,
+      understanding: buildQuestionUnderstanding(question, contextWindow),
+      intent: inferCodingIntent(question, contextWindow),
+      languageHint: normalizeLanguageLabel(
+        inferLanguageFromText(`${question}\n${contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`)
+      ),
+      frameworkHint: normalizeFrameworkLabel(
+        inferFrameworkFromText(`${question}\n${contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`)
+      )
+    };
+
+    lastAnsweredRef.current = null;
+    lastQuestionSignatureRef.current = normalizeQuestionSignature(question);
+    lastQuestionTimestampRef.current = detectedAt;
+    addDetectedQuestionAnalytics(candidate);
+    setTypedQuestionInput("");
+    setError(null);
+    addLog("info", `⌨️ Typed question submitted: ${truncate(question, 80)}`);
+    generateAnswer(candidate).catch((error: any) => {
+      addLog("error", `❌ Typed question failed: ${error?.message || "unknown error"}`);
+    });
+  };
 
   const stopChunkedTranscription = () => {
     const recorder = mediaRecorderRef.current;
@@ -1417,6 +2102,10 @@ Return STRICT JSON only (no markdown):
         while (chunkQueueRef.current.length > 0) {
           if (!meetingStateRef.current.isRecording || meetingStateRef.current.isPaused) break;
           if (!micEnabledRef.current) {
+            chunkQueueRef.current = [];
+            break;
+          }
+          if (!shouldProcessLiveAudio()) {
             chunkQueueRef.current = [];
             break;
           }
@@ -1458,6 +2147,7 @@ Return STRICT JSON only (no markdown):
       if (!event.data || event.data.size === 0) return;
       if (!meetingStateRef.current.isRecording || meetingStateRef.current.isPaused) return;
       if (!micEnabledRef.current) return;
+      if (!shouldProcessLiveAudio()) return;
 
       chunkQueueRef.current.push(event.data);
       if (chunkQueueRef.current.length > maxChunkQueue) {
@@ -1480,6 +2170,14 @@ Return STRICT JSON only (no markdown):
   };
 
   const teardownAudioCapture = async () => {
+    if (manualQuestionFinalizeTimerRef.current) {
+      clearTimeout(manualQuestionFinalizeTimerRef.current);
+      manualQuestionFinalizeTimerRef.current = null;
+    }
+    manualQuestionRecordingRef.current = false;
+    manualQuestionFinalizingRef.current = false;
+    manualQuestionSegmentsRef.current = [];
+
     for (const pipeline of audioPipelinesRef.current) {
       try {
         pipeline.sourceNode.disconnect();
@@ -1528,6 +2226,7 @@ Return STRICT JSON only (no markdown):
       const state = meetingStateRef.current;
       if (!state.isRecording || state.isPaused) return;
       if (source === "user" && !micEnabledRef.current) return;
+      if (!shouldProcessLiveAudio()) return;
       window.electronAPI.audio.sendPCM(event.data, source);
     };
 
@@ -1593,13 +2292,19 @@ Return STRICT JSON only (no markdown):
 
     const unsubscribeTranscript = window.electronAPI.meeting.onTranscript((payload) => {
       const transcript = toTranscriptPayload(payload);
+      if (!shouldProcessLiveAudio()) return;
       appendTranscriptEntry(transcript);
     });
 
     const unsubscribePartial = window.electronAPI.meeting.onPartial((payload) => {
       const partial = toTranscriptPayload(payload);
       if (!partial.text.trim()) return;
+      if (!shouldProcessLiveAudio()) return;
       setPartialTranscript(partial);
+      if (isManualCaptureActive()) {
+        const committed = manualQuestionSegmentsRef.current.join(" ").trim();
+        updateManualQuestionPreview(`${committed} ${partial.text}`.replace(/\s+/g, " ").trim());
+      }
     });
 
     const unsubscribeError = window.electronAPI.meeting.onError((payload) => {
@@ -1670,6 +2375,10 @@ Return STRICT JSON only (no markdown):
         clearTimeout(questionDebounceRef.current);
         questionDebounceRef.current = null;
       }
+      if (manualQuestionFinalizeTimerRef.current) {
+        clearTimeout(manualQuestionFinalizeTimerRef.current);
+        manualQuestionFinalizeTimerRef.current = null;
+      }
       if (analyticsSyncTimerRef.current) {
         clearTimeout(analyticsSyncTimerRef.current);
         analyticsSyncTimerRef.current = null;
@@ -1690,6 +2399,8 @@ Return STRICT JSON only (no markdown):
       setLiveTranscript(null);
       setPartialTranscript(null);
       setAnswers([]);
+      setTypedQuestionInput("");
+      updateProblemMemory(null, { replace: true });
       setIsMicEnabled(true);
       micEnabledRef.current = true;
       transcriptHistoryRef.current = [];
@@ -1698,12 +2409,23 @@ Return STRICT JSON only (no markdown):
       lastAnsweredRef.current = null;
       lastQuestionSignatureRef.current = null;
       lastQuestionTimestampRef.current = 0;
+      lastTranscriptSignatureRef.current = null;
       hasInterviewerAudioRef.current = false;
       cloudOffloadAttemptedRef.current = false;
       chunkQueueRef.current = [];
       droppedLocalChunksRef.current = 0;
       modelLastCallAtRef.current = 0;
       answerLastStartedAtRef.current = 0;
+      manualQuestionRecordingRef.current = false;
+      manualQuestionFinalizingRef.current = false;
+      manualQuestionSegmentsRef.current = [];
+      if (manualQuestionFinalizeTimerRef.current) {
+        clearTimeout(manualQuestionFinalizeTimerRef.current);
+        manualQuestionFinalizeTimerRef.current = null;
+      }
+      setIsManualQuestionRecording(false);
+      setIsManualQuestionProcessing(false);
+      updateManualQuestionPreview("");
       analyticsRef.current = {
         transcriptSegments: [],
         detectedQuestions: [],
@@ -1895,6 +2617,9 @@ Return STRICT JSON only (no markdown):
       } else {
         const result = await window.electronAPI.meeting.pause();
         if (result.success) {
+          if (isManualQuestionRecording || isManualQuestionProcessing) {
+            cancelManualQuestionCapture("🎙️ Manual question capture cancelled while paused.");
+          }
           setMeeting((prev) => {
             if (!prev) return null;
             const next = { ...prev, isPaused: true };
@@ -1930,6 +2655,9 @@ Return STRICT JSON only (no markdown):
     }
 
     if (!nextEnabled) {
+      if (isManualQuestionRecording || isManualQuestionProcessing) {
+        cancelManualQuestionCapture("🎙️ Manual question capture cancelled because the mic was muted.");
+      }
       chunkQueueRef.current = [];
       setPartialTranscript(null);
       addLog("warning", "🔇 Mic muted (your voice is not being transcribed)");
@@ -1946,6 +2674,9 @@ Return STRICT JSON only (no markdown):
     if (questionDebounceRef.current) {
       clearTimeout(questionDebounceRef.current);
       questionDebounceRef.current = null;
+    }
+    if (isManualQuestionRecording || isManualQuestionProcessing) {
+      cancelManualQuestionCapture();
     }
 
     updateAnalyticsRef((current) => ({
@@ -2274,6 +3005,41 @@ Return STRICT JSON only (no markdown):
 
         <div className="meeting-section mb-4 rounded-xl p-3">
           <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-700">
+            Answer Trigger
+          </div>
+          <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 text-xs font-semibold">
+            <button
+              type="button"
+              onClick={() => setAnswerCaptureMode("auto")}
+              className={`rounded-lg px-3 py-1.5 transition ${
+                answerCaptureMode === "auto"
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-slate-600 hover:bg-slate-100"
+              }`}
+            >
+              Auto
+            </button>
+            <button
+              type="button"
+              onClick={() => setAnswerCaptureMode("manual")}
+              className={`rounded-lg px-3 py-1.5 transition ${
+                answerCaptureMode === "manual"
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-slate-600 hover:bg-slate-100"
+              }`}
+            >
+              Manual
+            </button>
+          </div>
+          <div className="mt-2 text-[11px] text-slate-600">
+            {answerCaptureMode === "manual"
+              ? "AI answers only after you tap Record question and stop recording."
+              : "AI listens to the live transcript and answers when it detects a likely question."}
+          </div>
+        </div>
+
+        <div className="meeting-section mb-4 rounded-xl p-3">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-700">
             Performance Controls
           </div>
           <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
@@ -2453,127 +3219,281 @@ Return STRICT JSON only (no markdown):
       >
         <div
           ref={transcriptScrollRef}
-          className="meeting-scroll-panel max-h-[52vh] overflow-y-auto rounded-xl p-3"
+          className="meeting-scroll-panel meeting-transcript-panel max-h-[52vh] overflow-y-auto rounded-xl p-3"
         >
           <div className="mb-2 flex items-center justify-between">
-            <h3 className="text-sm font-bold text-gray-800">Conversation</h3>
-            <span className="text-xs text-gray-500">{meeting?.transcripts.length || 0} lines</span>
+            <h3 className="meeting-transcript-title text-sm font-bold">Conversation</h3>
+            <span className="meeting-transcript-count text-xs">{meeting?.transcripts.length || 0} lines</span>
           </div>
 
           {(!meeting || meeting.transcripts.length === 0) && !partialTranscript && !liveTranscript && (
-            <div className="py-8 text-center text-xs text-gray-500">
-              <Mic className="mx-auto mb-2 h-8 w-8 opacity-30" />
+            <div className="meeting-transcript-empty py-8 text-center text-xs">
+              <Mic className="meeting-transcript-empty-icon mx-auto mb-2 h-8 w-8" />
               <p>Waiting for transcript...</p>
             </div>
           )}
 
           <div className="space-y-2">
             {meeting?.transcripts.map((item, i) => (
-              <div key={`${item.timestamp}-${i}`} className="rounded-lg border border-gray-200 bg-white p-2.5">
+              <div key={`${item.timestamp}-${i}`} className="meeting-transcript-card rounded-lg p-2.5">
                 <div className="mb-1 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-blue-700">
+                  <span className="meeting-transcript-speaker text-xs font-semibold">
                     {formatSourceLabel(item.source === "interviewer" ? "interviewer" : "user")}
                   </span>
-                  <span className="font-mono text-[10px] text-gray-500">
+                  <span className="meeting-transcript-time font-mono text-[10px]">
                     {new Date(item.timestamp).toLocaleTimeString()}
                   </span>
                 </div>
-                <p className="text-sm text-gray-800">{item.text}</p>
+                <p className="meeting-transcript-text text-sm">{item.text}</p>
               </div>
             ))}
 
             {partialTranscript && (
-              <div className="rounded border border-blue-300/50 bg-blue-50/70 p-2">
+              <div className="meeting-transcript-live rounded p-2">
                 <div className="mb-1 flex items-center gap-1">
-                  <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
-                  <span className="text-xs font-semibold text-blue-700">
+                  <div className="meeting-transcript-live-dot h-1.5 w-1.5 animate-pulse rounded-full" />
+                  <span className="meeting-transcript-live-label text-xs font-semibold">
                     {formatSourceLabel(partialTranscript.source)} (live)
                   </span>
                 </div>
-                <p className="text-sm italic text-blue-900">{partialTranscript.text}</p>
+                <p className="meeting-transcript-live-text text-sm italic">{partialTranscript.text}</p>
               </div>
             )}
           </div>
         </div>
 
-        <div className="meeting-scroll-panel max-h-[52vh] overflow-y-auto rounded-xl p-3">
+        <div className="meeting-scroll-panel meeting-answer-panel max-h-[52vh] overflow-y-auto rounded-xl p-3">
           <div className="mb-2 flex items-center justify-between">
-            <h3 className="text-sm font-bold text-gray-800">AI Answers</h3>
-            <div className="flex items-center gap-2">
+            <h3 className="meeting-answer-title text-sm font-bold">AI Answers</h3>
+            <div className="meeting-answer-toolbar flex flex-wrap items-center justify-end gap-2">
+              <div className="meeting-answer-mode-toggle inline-flex rounded-lg p-0.5 text-xs font-semibold">
+                <button
+                  type="button"
+                  onClick={() => setAnswerCaptureMode("auto")}
+                  disabled={isManualQuestionRecording || isManualQuestionProcessing}
+                  className={`meeting-answer-mode-button rounded-md px-2 py-1 transition ${
+                    answerCaptureMode === "auto"
+                      ? "is-active"
+                      : ""
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  Auto
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAnswerCaptureMode("manual")}
+                  disabled={isManualQuestionRecording || isManualQuestionProcessing}
+                  className={`meeting-answer-mode-button rounded-md px-2 py-1 transition ${
+                    answerCaptureMode === "manual"
+                      ? "is-active"
+                      : ""
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  Manual
+                </button>
+              </div>
+              {answerCaptureMode === "manual" && (
+                <button
+                  type="button"
+                  onClick={isManualQuestionRecording ? stopManualQuestionCapture : startManualQuestionCapture}
+                  disabled={isManualQuestionProcessing || meeting?.isPaused || !isMicEnabled}
+                  className={`meeting-answer-action-button rounded border px-2 py-1 text-xs font-semibold transition ${
+                    isManualQuestionRecording
+                      ? "is-recording"
+                      : isManualQuestionProcessing || meeting?.isPaused || !isMicEnabled
+                      ? "is-disabled cursor-not-allowed"
+                      : "is-manual"
+                  }`}
+                >
+                  {isManualQuestionRecording
+                    ? "Stop question"
+                    : isManualQuestionProcessing
+                    ? "Processing..."
+                    : "Record question"}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={handleAnswerFromScreen}
                 disabled={isScreenAnswering}
-                className={`rounded border px-2 py-1 text-xs font-semibold transition ${
+                className={`meeting-answer-action-button meeting-answer-screen-button rounded border px-2 py-1 text-xs font-semibold transition ${
                   isScreenAnswering
-                    ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-500"
-                    : "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+                    ? "is-disabled cursor-not-allowed"
+                    : ""
                 }`}
               >
                 {isScreenAnswering ? "Analyzing screen..." : "Answer from screen"}
               </button>
-              <span className="text-xs text-gray-500">{answers.length} items</span>
+              <span className="meeting-answer-count text-xs">{answers.length} items</span>
             </div>
           </div>
 
+          {answerCaptureMode === "manual" && (
+            <div
+              className={`meeting-answer-callout mb-3 rounded-lg px-3 py-2 text-xs ${
+                isManualQuestionRecording
+                  ? "is-recording"
+                  : isManualQuestionProcessing
+                  ? "is-processing"
+                  : manualQuestionPreview
+                  ? "has-preview"
+                  : ""
+              }`}
+            >
+              <div className="font-semibold">Manual mode</div>
+              <div className="mt-1">
+                {isManualQuestionRecording
+                  ? "Recording your mic question now. Click Stop question when you finish."
+                  : isManualQuestionProcessing
+                  ? "Finalizing the captured question and preparing the answer..."
+                  : manualQuestionPreview
+                  ? `Last captured question: ${manualQuestionPreview}`
+                  : "Click Record question to capture only your next question, then the AI will answer after you stop."}
+              </div>
+            </div>
+          )}
+
+          <form
+            className="mb-3 flex items-center gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              submitTypedQuestion();
+            }}
+          >
+            <input
+              type="text"
+              value={typedQuestionInput}
+              onChange={(event) => setTypedQuestionInput(event.target.value)}
+              placeholder="Type a question and press Enter"
+              disabled={isManualQuestionRecording || isManualQuestionProcessing}
+              className="meeting-answer-input min-w-0 flex-1 rounded-lg px-3 py-2 text-sm focus:outline-none disabled:cursor-not-allowed"
+            />
+            <button
+              type="submit"
+              disabled={
+                isManualQuestionRecording ||
+                isManualQuestionProcessing ||
+                typedQuestionInput.replace(/\s+/g, " ").trim().length === 0
+              }
+              className="meeting-answer-send rounded-lg px-3 py-2 text-xs font-semibold transition disabled:cursor-not-allowed"
+            >
+              Send
+            </button>
+          </form>
+
           {answers.length === 0 ? (
-            <div className="py-8 text-center text-xs text-gray-500">
-              <MessageSquare className="mx-auto mb-2 h-8 w-8 opacity-30" />
+            <div className="meeting-answer-empty py-8 text-center text-xs">
+              <MessageSquare className="meeting-answer-empty-icon mx-auto mb-2 h-8 w-8" />
               <p>No answers yet</p>
-              <p className="mt-1 text-xs text-gray-400">
-                Answers appear when a likely interview question is detected.
+              <p className="meeting-answer-empty-subtext mt-1 text-xs">
+                {answerCaptureMode === "manual"
+                  ? "Manual mode is on. Record a question and stop to generate an answer."
+                  : "Answers appear when a likely interview question is detected."}
               </p>
               {!hasInterviewerAudioRef.current && (
-                <p className="mt-1 text-xs text-gray-400">Mic-only mode is active; question detection uses mic transcript.</p>
+                <p className="meeting-answer-empty-subtext mt-1 text-xs">Mic-only mode is active; question detection uses mic transcript.</p>
               )}
             </div>
           ) : (
             <div className="space-y-2">
               {answers.map((item) => (
-                <div key={item.id} className="rounded-lg border border-gray-200 bg-white p-2.5">
+                <div key={item.id} className="meeting-answer-card rounded-lg p-2.5">
                   <div className="mb-1 flex items-center justify-between">
-                    <span className="text-xs font-semibold text-blue-700">Question</span>
-                    <span className="font-mono text-[10px] text-gray-500">
+                    <span className="meeting-answer-card-label text-xs font-semibold">Question</span>
+                    <span className="meeting-answer-time font-mono text-[10px]">
                       {new Date(item.createdAt).toLocaleTimeString()}
                     </span>
                   </div>
-                  <p className="mb-2 text-sm text-gray-800">{item.question}</p>
+                  <p className="meeting-answer-question mb-2 text-sm">{item.question}</p>
+
+                  <div className="mb-2 flex flex-wrap items-center gap-1">
+                    {(item.responseMetadata?.intent || item.intent) && (
+                      <div className="meeting-answer-badge is-intent inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold">
+                        {formatIntentLabel(item.responseMetadata?.intent || item.intent)}
+                      </div>
+                    )}
+                    {(item.responseMetadata?.language || item.languageHint) && (
+                      <div className="meeting-answer-badge is-language inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold">
+                        {item.responseMetadata?.language || item.languageHint}
+                      </div>
+                    )}
+                    {(item.responseMetadata?.framework || item.frameworkHint) && (
+                      <div className="meeting-answer-badge is-framework inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold">
+                        {item.responseMetadata?.framework || item.frameworkHint}
+                      </div>
+                    )}
+                  </div>
 
                   {typeof item.confidence === "number" && (
-                    <div className="mb-2 inline-flex items-center rounded bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700">
+                    <div className="meeting-answer-badge is-confidence mb-2 inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold">
                       {item.confidence}% confidence
                     </div>
                   )}
 
                   {typeof item.qualityOverall === "number" && (
-                    <div className="mb-2 ml-1 inline-flex items-center rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                    <div className="meeting-answer-badge is-quality mb-2 ml-1 inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold">
                       {Math.round(item.qualityOverall * 100)}% quality
                     </div>
                   )}
 
-                  {item.status === "pending" && <div className="text-xs text-gray-500">Generating answer...</div>}
+                  {item.status === "pending" && <div className="meeting-answer-status text-xs">Generating answer...</div>}
                   {item.status === "error" && (
-                    <div className="text-xs text-red-600">{item.error || "Failed to generate answer."}</div>
+                    <div className="meeting-answer-status is-error text-xs">{item.error || "Failed to generate answer."}</div>
                   )}
                   {item.status === "ready" && item.response && (
                     <div className="space-y-2">
                       <div className="flex flex-wrap items-center gap-1">
-                        <span className="rounded bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
-                          {item.stage === "refined" ? "Refined" : "Fast draft"}
+                        <span className="meeting-answer-badge is-stage rounded px-2 py-0.5 text-[10px] font-semibold">
+                          {item.stage === "refined" ? "Refined" : "Draft"}
                         </span>
                         {item.isRefining && (
-                          <span className="rounded bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                          <span className="meeting-answer-badge is-refining rounded px-2 py-0.5 text-[10px] font-semibold">
                             Refining...
                           </span>
                         )}
+                        {!item.isRefining && (
+                          <button
+                            type="button"
+                            onClick={() => requestAnswerRefinement(item.id)}
+                            className="meeting-answer-expand-button rounded border px-2 py-0.5 text-[10px]"
+                          >
+                            {item.stage === "refined" ? "Refine again" : "Refine"}
+                          </button>
+                        )}
                         {item.qualityNotes && (
-                          <span className="text-[10px] text-slate-500">{item.qualityNotes}</span>
+                          <span className="meeting-answer-inline-note text-[10px]">{item.qualityNotes}</span>
                         )}
                       </div>
-                      <div className="whitespace-pre-wrap text-sm text-gray-800">{item.response}</div>
+                      {renderAnswerContent(item)}
 
-                      <div className="rounded bg-slate-50 px-2 py-1 text-xs text-slate-700">
-                        <div className="mb-1 font-semibold">Need another angle?</div>
+                      {(item.responseMetadata?.framework ||
+                        item.responseMetadata?.approach ||
+                        item.responseMetadata?.timeComplexity ||
+                        item.responseMetadata?.spaceComplexity) && (
+                        <div className="meeting-answer-understanding rounded px-2 py-1 text-xs">
+                          <div className="font-semibold">Answer metadata</div>
+                          {item.responseMetadata?.framework && (
+                            <div className="mt-1">
+                              <span className="font-semibold">Framework:</span> {item.responseMetadata.framework}
+                            </div>
+                          )}
+                          {item.responseMetadata?.approach && (
+                            <div className="mt-1">
+                              <span className="font-semibold">Approach:</span> {item.responseMetadata.approach}
+                            </div>
+                          )}
+                          {(item.responseMetadata?.timeComplexity || item.responseMetadata?.spaceComplexity) && (
+                            <div className="mt-1">
+                              <span className="font-semibold">Complexity:</span>{" "}
+                              {item.responseMetadata?.timeComplexity || "n/a"} /{" "}
+                              {item.responseMetadata?.spaceComplexity || "n/a"}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="meeting-answer-expand-panel rounded px-2 py-1 text-xs">
+                        <div className="meeting-answer-expand-title mb-1 font-semibold">Need another angle?</div>
                         <div className="flex flex-wrap gap-1">
                           {getExpansionSuggestions(item).map((suggestion) => {
                             const pendingSamePrompt = Boolean(
@@ -2589,10 +3509,10 @@ Return STRICT JSON only (no markdown):
                                 type="button"
                                 disabled={pendingSamePrompt}
                                 onClick={() => requestAnswerExpansion(item.id, suggestion)}
-                                className={`rounded border px-2 py-0.5 text-xs ${
+                                className={`meeting-answer-expand-button rounded border px-2 py-0.5 text-xs ${
                                   pendingSamePrompt
-                                    ? "cursor-not-allowed border-gray-200 bg-gray-100 text-gray-500"
-                                    : "border-slate-300 bg-white text-slate-700 hover:bg-slate-100"
+                                    ? "is-disabled cursor-not-allowed"
+                                    : ""
                                 }`}
                               >
                                 {pendingSamePrompt ? `${suggestion}...` : suggestion}
@@ -2603,20 +3523,20 @@ Return STRICT JSON only (no markdown):
                       </div>
 
                       {item.deepDives && item.deepDives.length > 0 && (
-                        <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-900">
-                          <div className="mb-1 font-semibold">More details</div>
+                        <div className="meeting-answer-deepdive rounded px-2 py-1 text-xs">
+                          <div className="meeting-answer-deepdive-title mb-1 font-semibold">More details</div>
                           <div className="space-y-1">
                             {item.deepDives.map((dive) => (
-                              <div key={dive.id} className="rounded border border-amber-100 bg-white/70 px-2 py-1">
-                                <div className="mb-0.5 text-[10px] font-semibold text-amber-700">{dive.prompt}</div>
+                              <div key={dive.id} className="meeting-answer-deepdive-item rounded px-2 py-1">
+                                <div className="meeting-answer-deepdive-prompt mb-0.5 text-[10px] font-semibold">{dive.prompt}</div>
                                 {dive.status === "pending" && (
-                                  <div className="text-[10px] text-amber-700">Generating details...</div>
+                                  <div className="meeting-answer-deepdive-status text-[10px]">Generating details...</div>
                                 )}
                                 {dive.status === "error" && (
-                                  <div className="text-[10px] text-red-600">{dive.error || "Failed to generate details."}</div>
+                                  <div className="meeting-answer-deepdive-status is-error text-[10px]">{dive.error || "Failed to generate details."}</div>
                                 )}
                                 {dive.status === "ready" && (
-                                  <div className="whitespace-pre-wrap text-xs text-amber-900">
+                                  <div className="meeting-answer-deepdive-response whitespace-pre-wrap text-xs">
                                     {dive.response}
                                   </div>
                                 )}
@@ -2627,7 +3547,7 @@ Return STRICT JSON only (no markdown):
                       )}
 
                       {item.understanding && (
-                        <div className="rounded bg-indigo-50 px-2 py-1 text-xs text-indigo-700">
+                        <div className="meeting-answer-understanding rounded px-2 py-1 text-xs">
                           <div className="font-semibold">Extracted constraints / edge cases</div>
                           <div className="mt-1">
                             Constraints: {item.understanding.constraints.join(", ") || "none"}
@@ -2638,7 +3558,7 @@ Return STRICT JSON only (no markdown):
                         </div>
                       )}
                       {(item.provider || item.model || typeof item.latencyMs === "number") && (
-                        <div className="text-[10px] text-gray-500">
+                        <div className="meeting-answer-metadata text-[10px]">
                           {item.provider ? `Provider: ${item.provider}` : "Provider: unknown"}{" "}
                           {item.model ? `• Model: ${item.model}` : ""}{" "}
                           {typeof item.latencyMs === "number" ? `• ${item.latencyMs}ms` : ""}

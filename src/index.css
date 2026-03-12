@@ -532,6 +532,436 @@ body {
   -webkit-backdrop-filter: blur(10px) saturate(130%);
 }
 
+.meeting-answer-panel {
+  color: rgba(241, 245, 249, 0.94);
+  border-color: rgba(191, 219, 254, 0.16);
+  background:
+    radial-gradient(130% 135% at 0% 0%, rgba(56, 189, 248, 0.16), transparent 42%),
+    radial-gradient(130% 140% at 100% 100%, rgba(99, 102, 241, 0.18), transparent 44%),
+    linear-gradient(180deg, rgba(7, 12, 25, 0.72), rgba(9, 15, 28, 0.56));
+  box-shadow:
+    0 20px 44px rgba(2, 6, 23, 0.46),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+}
+
+.meeting-transcript-panel {
+  color: rgba(241, 245, 249, 0.94);
+  border-color: rgba(191, 219, 254, 0.16);
+  background:
+    radial-gradient(130% 135% at 0% 0%, rgba(56, 189, 248, 0.12), transparent 42%),
+    radial-gradient(130% 140% at 100% 100%, rgba(59, 130, 246, 0.14), transparent 44%),
+    linear-gradient(180deg, rgba(7, 12, 25, 0.68), rgba(9, 15, 28, 0.54));
+  box-shadow:
+    0 20px 44px rgba(2, 6, 23, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+}
+
+.meeting-transcript-title {
+  color: #f8fbff;
+  text-shadow: 0 1px 12px rgba(15, 23, 42, 0.42);
+}
+
+.meeting-transcript-count,
+.meeting-transcript-time {
+  color: rgba(191, 219, 254, 0.58);
+}
+
+.meeting-transcript-empty {
+  color: rgba(226, 232, 240, 0.78);
+}
+
+.meeting-transcript-empty-icon {
+  opacity: 0.42;
+}
+
+.meeting-transcript-card {
+  border: 1px solid rgba(191, 219, 254, 0.14);
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.56), rgba(15, 23, 42, 0.38));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 12px 24px rgba(2, 6, 23, 0.14);
+}
+
+.meeting-transcript-speaker {
+  color: #93c5fd;
+}
+
+.meeting-transcript-text {
+  color: rgba(248, 250, 252, 0.96);
+}
+
+.meeting-transcript-live {
+  border: 1px solid rgba(96, 165, 250, 0.18);
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.16), rgba(15, 23, 42, 0.22));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.meeting-transcript-live-dot {
+  background: #60a5fa;
+}
+
+.meeting-transcript-live-label {
+  color: rgba(191, 219, 254, 0.92);
+}
+
+.meeting-transcript-live-text {
+  color: rgba(239, 246, 255, 0.92);
+}
+
+.meeting-answer-title {
+  color: #f8fbff;
+  text-shadow: 0 1px 12px rgba(15, 23, 42, 0.42);
+}
+
+.meeting-answer-toolbar {
+  row-gap: 8px;
+}
+
+.meeting-answer-mode-toggle {
+  border: 1px solid rgba(191, 219, 254, 0.14);
+  background: rgba(15, 23, 42, 0.38);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 10px 18px rgba(2, 6, 23, 0.24);
+}
+
+.meeting-answer-mode-button {
+  color: rgba(226, 232, 240, 0.78);
+}
+
+.meeting-answer-mode-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+}
+
+.meeting-answer-mode-button.is-active {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.88), rgba(96, 165, 250, 0.74));
+  color: #ffffff;
+  box-shadow:
+    0 8px 18px rgba(37, 99, 235, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.meeting-answer-action-button {
+  border-color: rgba(191, 219, 254, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: #f8fbff;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 10px 22px rgba(2, 6, 23, 0.2);
+}
+
+.meeting-answer-action-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.meeting-answer-action-button.is-manual {
+  border-color: rgba(110, 231, 183, 0.24);
+  background: linear-gradient(135deg, rgba(5, 150, 105, 0.3), rgba(13, 148, 136, 0.22));
+}
+
+.meeting-answer-action-button.is-recording {
+  border-color: rgba(251, 113, 133, 0.28);
+  background: linear-gradient(135deg, rgba(225, 29, 72, 0.34), rgba(251, 113, 133, 0.24));
+}
+
+.meeting-answer-action-button.is-disabled,
+.meeting-answer-action-button:disabled {
+  border-color: rgba(148, 163, 184, 0.14);
+  background: rgba(148, 163, 184, 0.12);
+  color: rgba(203, 213, 225, 0.46);
+  box-shadow: none;
+}
+
+.meeting-answer-screen-button {
+  border-color: rgba(129, 140, 248, 0.2);
+  background: linear-gradient(135deg, rgba(79, 70, 229, 0.34), rgba(59, 130, 246, 0.22));
+}
+
+.meeting-answer-count {
+  color: rgba(226, 232, 240, 0.66);
+}
+
+.meeting-answer-callout {
+  border: 1px solid rgba(110, 231, 183, 0.22);
+  background: linear-gradient(180deg, rgba(16, 185, 129, 0.16), rgba(15, 23, 42, 0.18));
+  color: rgba(236, 253, 245, 0.96);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.meeting-answer-callout.is-recording {
+  border-color: rgba(251, 113, 133, 0.24);
+  background: linear-gradient(180deg, rgba(225, 29, 72, 0.18), rgba(15, 23, 42, 0.22));
+}
+
+.meeting-answer-callout.is-processing {
+  border-color: rgba(250, 204, 21, 0.24);
+  background: linear-gradient(180deg, rgba(202, 138, 4, 0.18), rgba(15, 23, 42, 0.22));
+  color: rgba(254, 249, 195, 0.96);
+}
+
+.meeting-answer-callout.has-preview {
+  border-color: rgba(96, 165, 250, 0.24);
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.16), rgba(15, 23, 42, 0.2));
+}
+
+.meeting-answer-input {
+  border: 1px solid rgba(191, 219, 254, 0.16);
+  background: rgba(6, 11, 23, 0.62);
+  color: #f8fbff;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 10px 22px rgba(2, 6, 23, 0.18);
+}
+
+.meeting-answer-input::placeholder {
+  color: rgba(191, 219, 254, 0.46);
+}
+
+.meeting-answer-input:focus {
+  border-color: rgba(96, 165, 250, 0.4);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 0 0 3px rgba(59, 130, 246, 0.14),
+    0 12px 24px rgba(2, 6, 23, 0.24);
+}
+
+.meeting-answer-input:disabled {
+  background: rgba(71, 85, 105, 0.26);
+  color: rgba(226, 232, 240, 0.5);
+}
+
+.meeting-answer-send {
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.6), rgba(14, 165, 233, 0.38));
+  color: #ffffff;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 10px 22px rgba(2, 6, 23, 0.22);
+}
+
+.meeting-answer-send:hover:not(:disabled) {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.72), rgba(56, 189, 248, 0.46));
+}
+
+.meeting-answer-send:disabled {
+  border-color: rgba(148, 163, 184, 0.14);
+  background: rgba(148, 163, 184, 0.14);
+  color: rgba(226, 232, 240, 0.46);
+  box-shadow: none;
+}
+
+.meeting-answer-empty {
+  color: rgba(226, 232, 240, 0.78);
+}
+
+.meeting-answer-empty-icon {
+  opacity: 0.52;
+}
+
+.meeting-answer-empty-subtext {
+  color: rgba(191, 219, 254, 0.58);
+}
+
+.meeting-answer-card {
+  border: 1px solid rgba(191, 219, 254, 0.14);
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.56), rgba(15, 23, 42, 0.4));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 12px 24px rgba(2, 6, 23, 0.16);
+}
+
+.meeting-answer-card-label {
+  color: #93c5fd;
+}
+
+.meeting-answer-time,
+.meeting-answer-metadata,
+.meeting-answer-inline-note {
+  color: rgba(191, 219, 254, 0.58);
+}
+
+.meeting-answer-question,
+.meeting-answer-response {
+  color: rgba(248, 250, 252, 0.96);
+}
+
+.meeting-answer-badge {
+  color: #f8fbff;
+  border: 1px solid transparent;
+}
+
+.meeting-answer-badge.is-confidence {
+  border-color: rgba(96, 165, 250, 0.2);
+  background: rgba(37, 99, 235, 0.22);
+}
+
+.meeting-answer-badge.is-quality {
+  border-color: rgba(110, 231, 183, 0.22);
+  background: rgba(5, 150, 105, 0.2);
+}
+
+.meeting-answer-badge.is-stage {
+  border-color: rgba(129, 140, 248, 0.24);
+  background: rgba(79, 70, 229, 0.22);
+}
+
+.meeting-answer-badge.is-refining {
+  border-color: rgba(253, 224, 71, 0.24);
+  background: rgba(202, 138, 4, 0.22);
+}
+
+.meeting-answer-badge.is-intent {
+  border-color: rgba(96, 165, 250, 0.16);
+  background: rgba(14, 165, 233, 0.14);
+}
+
+.meeting-answer-badge.is-language {
+  border-color: rgba(196, 181, 253, 0.2);
+  background: rgba(109, 40, 217, 0.18);
+}
+
+.meeting-answer-badge.is-framework {
+  border-color: rgba(251, 191, 36, 0.2);
+  background: rgba(180, 83, 9, 0.2);
+}
+
+.meeting-answer-status {
+  color: rgba(226, 232, 240, 0.7);
+}
+
+.meeting-answer-status.is-error,
+.meeting-answer-deepdive-status.is-error {
+  color: #fda4af;
+}
+
+.meeting-answer-expand-panel,
+.meeting-answer-understanding {
+  border: 1px solid rgba(191, 219, 254, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(226, 232, 240, 0.86);
+}
+
+.meeting-answer-expand-title {
+  color: rgba(248, 250, 252, 0.94);
+}
+
+.meeting-answer-expand-button {
+  border-color: rgba(191, 219, 254, 0.16);
+  background: rgba(15, 23, 42, 0.42);
+  color: rgba(241, 245, 249, 0.9);
+}
+
+.meeting-answer-expand-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.meeting-answer-expand-button.is-disabled,
+.meeting-answer-expand-button:disabled {
+  border-color: rgba(148, 163, 184, 0.14);
+  background: rgba(148, 163, 184, 0.12);
+  color: rgba(226, 232, 240, 0.44);
+}
+
+.meeting-answer-deepdive {
+  border: 1px solid rgba(253, 224, 71, 0.16);
+  background: linear-gradient(180deg, rgba(202, 138, 4, 0.14), rgba(15, 23, 42, 0.22));
+  color: rgba(255, 251, 235, 0.94);
+}
+
+.meeting-answer-deepdive-title,
+.meeting-answer-deepdive-prompt,
+.meeting-answer-deepdive-status {
+  color: rgba(254, 240, 138, 0.92);
+}
+
+.meeting-answer-deepdive-item {
+  border: 1px solid rgba(254, 240, 138, 0.14);
+  background: rgba(15, 23, 42, 0.34);
+}
+
+.meeting-answer-deepdive-response {
+  color: rgba(255, 251, 235, 0.92);
+}
+
+.meeting-problem-card {
+  border: 1px solid rgba(191, 219, 254, 0.16);
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(59, 130, 246, 0.16), transparent 40%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.5), rgba(15, 23, 42, 0.34));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 12px 24px rgba(2, 6, 23, 0.18);
+}
+
+.meeting-problem-title {
+  color: rgba(191, 219, 254, 0.82);
+}
+
+.meeting-problem-chip {
+  border: 1px solid rgba(191, 219, 254, 0.16);
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(241, 245, 249, 0.9);
+}
+
+.meeting-problem-statement {
+  color: rgba(248, 250, 252, 0.96);
+}
+
+.meeting-problem-meta {
+  color: rgba(191, 219, 254, 0.74);
+}
+
+.meeting-answer-code-shell {
+  overflow: hidden;
+  border: 1px solid rgba(191, 219, 254, 0.14);
+  border-radius: 0.95rem;
+  background: rgba(2, 6, 23, 0.7);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 10px 18px rgba(2, 6, 23, 0.18);
+}
+
+.meeting-answer-code-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.55rem 0.85rem;
+  background: rgba(15, 23, 42, 0.68);
+  border-bottom: 1px solid rgba(191, 219, 254, 0.12);
+}
+
+.meeting-answer-code-label {
+  color: rgba(191, 219, 254, 0.84);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.meeting-answer-copy-button {
+  border: 1px solid rgba(191, 219, 254, 0.16);
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(241, 245, 249, 0.92);
+  font-size: 0.7rem;
+  font-weight: 700;
+  transition: background 180ms ease, border-color 180ms ease;
+}
+
+.meeting-answer-copy-button:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(191, 219, 254, 0.24);
+}
+
 .app-anim-rise {
   animation: appRise 340ms cubic-bezier(0.2, 0.85, 0.2, 1);
 }

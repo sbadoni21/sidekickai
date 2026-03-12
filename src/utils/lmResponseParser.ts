@@ -56,8 +56,8 @@ export function parseLLMResponse(response: string): ParsedLLMResponse {
   // Check if response contains code blocks
   const codeBlockMatch = response.match(/```(\w+)?\n([\s\S]+?)```/);
   if (codeBlockMatch) {
-    const language = codeBlockMatch[1] || 'python';
     const code = codeBlockMatch[2].trim();
+    const language = codeBlockMatch[1] || detectLanguage(code);
     
     // Extract any text before the code block as thoughts
     const textBefore = response.substring(0, response.indexOf('```')).trim();
@@ -131,10 +131,10 @@ function formatJSON(obj: any): string {
  */
 function looksLikeCode(text: string): boolean {
   const codeIndicators = [
-    /^(def|class|function|const|let|var|import|from|public|private)\s/m,
+    /^(def|class|function|const|let|var|import|from|public|private|fun|val|SELECT|INSERT|UPDATE|DELETE|<\?php|func|object|case class)\s/m,
     /[{}\[\]();]/,
     /^\s{2,}/m, // Indentation
-    /(=>|===|!==|\|\||&&)/,
+    /(=>|===|!==|\|\||&&|::|->|<-)/,
   ];
   
   const matches = codeIndicators.filter(pattern => pattern.test(text));
@@ -147,7 +147,28 @@ function looksLikeCode(text: string): boolean {
 function detectLanguage(code: string): string {
   if (!code) return 'python';
   
-  if (/^(def|class|import|from)\s/.test(code) || /:\s*$/.test(code)) {
+  if (/^\s*<\?php/.test(code) || /\$\w+\s*=/.test(code) || /\becho\b/.test(code)) {
+    return 'php';
+  }
+  if (/^\s*def\s+\w+[!?=]?\s*(\(|$)/m.test(code) || /\bputs\b/.test(code) || /^\s*end\s*$/m.test(code)) {
+    return 'ruby';
+  }
+  if (/^\s*fun\s+\w+\s*\(/m.test(code) || /^\s*(val|var)\s+\w+\s*[:=]/m.test(code) || /println\s*\(/.test(code)) {
+    return 'kotlin';
+  }
+  if (/^\s*func\s+\w+\s*\(/m.test(code) || /import\s+Foundation/.test(code) || /\bguard\b/.test(code)) {
+    return 'swift';
+  }
+  if (/^\s*object\s+\w+/m.test(code) || /^\s*case\s+class\s+\w+/m.test(code) || /println\s*\(/.test(code) && /=>/.test(code)) {
+    return 'scala';
+  }
+  if (/^\s*void\s+main\s*\(/m.test(code) || /import\s+'package:/.test(code) || /\bfinal\s+\w+\s*=/.test(code)) {
+    return 'dart';
+  }
+  if (/^\s*(SELECT|INSERT|UPDATE|DELETE|WITH|CREATE|ALTER|DROP)\b/im.test(code) || /\bFROM\b/i.test(code) && /\bWHERE\b/i.test(code)) {
+    return 'sql';
+  }
+  if (/^\s*(def|class)\s+\w+.*:\s*$/m.test(code) || /^\s*(import|from)\s+\w+/m.test(code) || /^\s*(if|for|while|with|try)\b.*:\s*$/m.test(code)) {
     return 'python';
   }
   if (/^(function|const|let|var|=>)/.test(code) || /^(export|import)/.test(code)) {

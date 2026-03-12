@@ -1,5 +1,6 @@
 import type { CodingQuestionUnderstanding } from "../meetingsStore"
 import type { ModelQuestionClassification, QuestionCandidate, MeetingAudioSource } from "./types"
+import { inferCodingIntent, inferFrameworkFromText, inferLanguageFromText } from "./problemMemory"
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
 
@@ -304,6 +305,30 @@ const normalizeUnderstanding = (
   }
 }
 
+const normalizeIntentLabel = (value: unknown): ModelQuestionClassification["intent"] => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+
+  if (
+    normalized === "theory" ||
+    normalized === "write_code" ||
+    normalized === "debug_code" ||
+    normalized === "optimize" ||
+    normalized === "complexity" ||
+    normalized === "dry_run" ||
+    normalized === "test_cases" ||
+    normalized === "clarify" ||
+    normalized === "behavioral" ||
+    normalized === "system_design" ||
+    normalized === "screen_analysis"
+  ) {
+    return normalized
+  }
+
+  return "other"
+}
+
 export const classifyQuestionIntentWithModel = async (
   candidate: QuestionCandidate,
   invokeLlm: (prompt: string) => Promise<string>
@@ -322,6 +347,9 @@ Return:
   "confidence": 0.0,
   "normalized_question": "single cleaned question",
   "question_type": "coding|system-design|behavioral|clarification|other",
+  "intent": "theory|write_code|debug_code|optimize|complexity|dry_run|test_cases|clarify|behavioral|system_design|other",
+  "language_hint": "JavaScript|TypeScript|Python|Kotlin|Swift|PHP|Ruby|Scala|Dart|SQL|Java|C++|C#|Go|Rust|none",
+  "framework_hint": "React|Angular|Vue|Next.js|Nuxt|Svelte|SvelteKit|Remix|SolidJS|Preact|Astro|Express|NestJS|Fastify|Koa|Hapi|Django|Flask|FastAPI|Spring Boot|Laravel|Ruby on Rails|ASP.NET Core|React Native|Expo|Flutter|Electron|Tauri|none",
   "rationale": "short reason",
   "question_understanding": {
     "problem_statement": "normalized problem statement",
@@ -332,6 +360,12 @@ Return:
 
 Rules:
 - Treat coding + system design + technical clarifications as valid interview questions.
+- Use "write_code" for requests asking for implementation, code, snippet, sample, or example.
+- Use "debug_code" for bug fixing or failure analysis.
+- Use "optimize" for better complexity or more efficient approach.
+- Use "complexity" for Big-O / time-space questions.
+- Use "dry_run" for trace / walkthrough requests.
+- Use "test_cases" for cases / edge-case enumeration requests.
 - If uncertain, lower confidence instead of hallucinating.
 - confidence must be in [0,1].`
 
@@ -349,6 +383,18 @@ Rules:
       typeof parsed?.question_type === "string" && parsed.question_type.trim()
         ? parsed.question_type.trim().toLowerCase()
         : "other"
+    const intent =
+      typeof parsed?.intent === "string" && parsed.intent.trim()
+        ? normalizeIntentLabel(parsed.intent)
+        : inferCodingIntent(normalizedQuestion, candidate.contextWindow)
+    const languageHint =
+      typeof parsed?.language_hint === "string" && parsed.language_hint.trim()
+        ? inferLanguageFromText(parsed.language_hint.trim())
+        : inferLanguageFromText(`${normalizedQuestion}\n${candidate.contextWindow}`)
+    const frameworkHint =
+      typeof parsed?.framework_hint === "string" && parsed.framework_hint.trim()
+        ? inferFrameworkFromText(parsed.framework_hint.trim()) || parsed.framework_hint.trim()
+        : inferFrameworkFromText(`${normalizedQuestion}\n${candidate.contextWindow}`)
     const rationale =
       typeof parsed?.rationale === "string" ? parsed.rationale.trim() : undefined
 
@@ -362,6 +408,9 @@ Rules:
       confidence,
       normalizedQuestion,
       questionType,
+      intent,
+      languageHint,
+      frameworkHint,
       rationale,
       understanding: normalizeUnderstanding(understandingRaw, fallbackUnderstanding)
     }
@@ -371,10 +420,12 @@ Rules:
       confidence: candidate.confidence,
       normalizedQuestion: candidate.question,
       questionType: "other",
+      intent: inferCodingIntent(candidate.question, candidate.contextWindow),
+      languageHint: inferLanguageFromText(`${candidate.question}\n${candidate.contextWindow}`),
+      frameworkHint: inferFrameworkFromText(`${candidate.question}\n${candidate.contextWindow}`),
       understanding: fallbackUnderstanding
     }
   }
 }
 
 export const getQuestionTokens = (text: string): string[] => tokenize(text)
-

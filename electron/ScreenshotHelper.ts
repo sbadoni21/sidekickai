@@ -28,10 +28,10 @@ export class ScreenshotHelper {
 
     // Create directories if they don't exist
     if (!fs.existsSync(this.screenshotDir)) {
-      fs.mkdirSync(this.screenshotDir)
+      fs.mkdirSync(this.screenshotDir, { recursive: true })
     }
     if (!fs.existsSync(this.extraScreenshotDir)) {
-      fs.mkdirSync(this.extraScreenshotDir)
+      fs.mkdirSync(this.extraScreenshotDir, { recursive: true })
     }
   }
 
@@ -88,7 +88,7 @@ export class ScreenshotHelper {
 
       if (this.view === "queue") {
         screenshotPath = path.join(this.screenshotDir, `${uuidv4()}.png`)
-        await screenshot({ filename: screenshotPath })
+        await this.captureScreenshotToFile(screenshotPath)
 
         this.screenshotQueue.push(screenshotPath)
         if (this.screenshotQueue.length > this.MAX_SCREENSHOTS) {
@@ -103,7 +103,7 @@ export class ScreenshotHelper {
         }
       } else {
         screenshotPath = path.join(this.extraScreenshotDir, `${uuidv4()}.png`)
-        await screenshot({ filename: screenshotPath })
+        await this.captureScreenshotToFile(screenshotPath)
 
         this.extraScreenshotQueue.push(screenshotPath)
         if (this.extraScreenshotQueue.length > this.MAX_SCREENSHOTS) {
@@ -125,6 +125,28 @@ export class ScreenshotHelper {
     } finally {
       // Ensure window is always shown again
       showMainWindow()
+    }
+  }
+
+  private async captureScreenshotToFile(targetPath: string): Promise<void> {
+    await fs.promises.mkdir(path.dirname(targetPath), { recursive: true })
+    const image = await screenshot({ format: "png" })
+
+    if (Buffer.isBuffer(image)) {
+      await fs.promises.writeFile(targetPath, image)
+      return
+    }
+
+    const sourcePath = typeof image === "string" ? image : ""
+    if (!sourcePath) {
+      throw new Error("Screenshot capture returned no image data")
+    }
+
+    const data = await fs.promises.readFile(sourcePath)
+    await fs.promises.writeFile(targetPath, data)
+
+    if (sourcePath !== targetPath) {
+      await fs.promises.unlink(sourcePath).catch((): void => undefined)
     }
   }
 
