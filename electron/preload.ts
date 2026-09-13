@@ -180,6 +180,7 @@ interface ElectronAPI {
     ) => Promise<{ success: boolean; error?: string }>;
     getCurrent: () => Promise<{ success: boolean; meeting?: Meeting; error?: string }>;
     getSttStatus: () => Promise<{ success: boolean; status?: MeetingSttStatus; error?: string }>;
+    clearContext: () => Promise<{ success: boolean; meeting?: Meeting; error?: string }>;
     updateAnalytics: (payload: Record<string, unknown>) => Promise<{ success: boolean; error?: string }>;
     onMindMapUpdated: (callback: (mindMap: MindMapNode) => void) => () => void;
     onNoteAdded: (callback: (note: MeetingNote) => void) => () => void;
@@ -431,6 +432,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
     getSttStatus: () =>
       ipcRenderer.invoke("meeting:get-stt-status"),
+
+    clearContext: () =>
+      ipcRenderer.invoke("meeting:clear-context"),
 
     updateAnalytics: (payload: Record<string, unknown>) =>
       ipcRenderer.invoke("meeting:update-analytics", payload),

@@ -2,10 +2,10 @@ import type { AnswerQualityAnalytics, CodingQuestionUnderstanding } from "../mee
 import { cleanLLMResponse, parseLLMResponse } from "../../utils/lmResponseParser"
 import {
   buildProblemMemoryContext,
-  inferCodingIntent,
   inferDefaultLanguageForFramework,
   inferFrameworkFromText,
   inferLanguageFromText,
+  inferMeetingIntent,
   isCodeHeavyIntent,
   normalizeFrameworkLabel,
   normalizeLanguageLabel
@@ -13,6 +13,7 @@ import {
 import type {
   AnswerResponseMetadata,
   CodingIntent,
+  MeetingRole,
   ParsedAnswerEnvelope,
   ProblemMemory,
   QualityJudgeResult,
@@ -137,26 +138,33 @@ const looksLikeDryRun = (answer: string): boolean =>
 const listsTestCases = (answer: string): boolean =>
   /\b(test case|case 1|input|output|empty|single element|duplicates?)\b/i.test(answer)
 
+const resolveRole = (candidate: QuestionCandidate): MeetingRole => candidate.role || "developer"
+
 const resolveIntent = (candidate: QuestionCandidate): CodingIntent =>
-  candidate.intent || inferCodingIntent(candidate.question, candidate.contextWindow)
+  candidate.intent || inferMeetingIntent(candidate.question, candidate.contextWindow, resolveRole(candidate))
 
 const resolveFramework = (
   candidate: QuestionCandidate,
   problemMemory?: ProblemMemory | null
-): string | undefined =>
-  normalizeFrameworkLabel(
+): string | undefined => {
+  if (resolveRole(candidate) === "product_manager") return undefined
+
+  return normalizeFrameworkLabel(
     candidate.frameworkHint ||
       problemMemory?.preferredFramework ||
       inferFrameworkFromText(
         `${candidate.question}\n${candidate.contextWindow}\n${buildProblemMemoryContext(problemMemory || null)}`
       )
   )
+}
 
 const resolveLanguage = (
   candidate: QuestionCandidate,
   problemMemory?: ProblemMemory | null
-): string | undefined =>
-  normalizeLanguageLabel(
+): string | undefined => {
+  if (resolveRole(candidate) === "product_manager") return undefined
+
+  return normalizeLanguageLabel(
     candidate.languageHint ||
       problemMemory?.preferredLanguage ||
       inferLanguageFromText(
@@ -164,6 +172,7 @@ const resolveLanguage = (
       ) ||
       inferDefaultLanguageForFramework(resolveFramework(candidate, problemMemory))
   )
+}
 
 const isJsxFramework = (framework: string | undefined): boolean => {
   const normalized = normalizeFrameworkLabel(framework)
@@ -383,10 +392,29 @@ const isAnswerFrameworkMismatch = (
 }
 
 const buildResponseContract = (
+  role: MeetingRole,
   intent: CodingIntent,
   preferredLanguage?: string,
   preferredFramework?: string
 ): string => {
+  if (role === "product_manager") {
+    if (intent === "behavioral") {
+      return "Return a concise first-person STAR answer under 140 words. Include the action you took and the measurable outcome."
+    }
+
+    if (intent === "system_design") {
+      return [
+        "Return a concise PM interview answer under 150 words.",
+        "Structure it as 3 short bullets:",
+        "- target user and problem",
+        "- recommendation or prioritization logic",
+        "- success metric and key risk"
+      ].join("\n")
+    }
+
+    return "Return a concise PM interview-ready answer under 130 words. Mention the user goal, your recommendation, and one tradeoff or metric when helpful."
+  }
+
   const stackLabel = buildStackLabel(preferredLanguage, preferredFramework)
   const codeFenceLanguage = resolveCodeFenceLanguage(preferredLanguage, preferredFramework)
 
@@ -450,10 +478,35 @@ const buildResponseContract = (
 }
 
 const buildIntentRules = (
+  role: MeetingRole,
   intent: CodingIntent,
   preferredLanguage?: string,
   preferredFramework?: string
 ): string[] => {
+  if (role === "product_manager") {
+    if (intent === "behavioral") {
+      return [
+        "Answer in first person using a clear situation, action, and result.",
+        "Keep the story concrete and outcome-oriented.",
+        "Mention collaboration, judgment, and measurable impact."
+      ]
+    }
+
+    if (intent === "system_design") {
+      return [
+        "Lead with the target user and the core problem.",
+        "State your prioritization or recommendation clearly.",
+        "Include one tradeoff, one risk, and one metric you would watch."
+      ]
+    }
+
+    return [
+      "Answer like a strong Product Manager in a live interview.",
+      "Prioritize user impact, business reasoning, and measurable outcomes.",
+      "Do not write code unless the question explicitly asks for a technical example."
+    ]
+  }
+
   if (intent === "write_code") {
     return [
       "The user explicitly wants code. Do not answer with theory only.",
@@ -522,6 +575,30 @@ const buildIntentRules = (
 }
 
 const buildJudgeRules = (intent: CodingIntent): string[] => {
+  return buildJudgeRulesForRole("developer", intent)
+}
+
+const buildJudgeRulesForRole = (role: MeetingRole, intent: CodingIntent): string[] => {
+  if (role === "product_manager") {
+    if (intent === "behavioral") {
+      return [
+        "Reward concrete actions and measurable outcomes.",
+        "Relevance is low if the answer stays generic and never reaches the result."
+      ]
+    }
+
+    if (intent === "system_design") {
+      return [
+        "Reward clear prioritization, tradeoffs, and success metrics.",
+        "Relevance is low if the answer ignores the user problem or business impact."
+      ]
+    }
+
+    return [
+      "Reward answers that include a recommendation plus at least one tradeoff or metric."
+    ]
+  }
+
   if (intent === "write_code" || intent === "debug_code") {
     return [
       "Relevance is low if the answer lacks concrete code.",
@@ -619,7 +696,7 @@ ${resourceContext || "No external resources."}
 
 Return STRICT JSON only:
 {
-  "answer": "${buildResponseContract(intent, preferredLanguage, preferredFramework)}",
+  "answer": "${buildResponseContract("developer", intent, preferredLanguage, preferredFramework)}",
   "follow_ups": ["optional follow-up 1", "optional follow-up 2"],
   "question_understanding": {
     "problemStatement": "normalized coding prompt",
@@ -683,7 +760,7 @@ Knowledge context:
 ${resourceContext || "No external resources."}
 
 Return plain text only.
-${buildResponseContract(intent, preferredLanguage, preferredFramework)}
+${buildResponseContract("developer", intent, preferredLanguage, preferredFramework)}
 
 Rules:
 - Rewrite the answer strictly in ${stackLabel}.
@@ -874,13 +951,17 @@ export const parseAnswerEnvelope = (
 
 export const generateFastDraftAnswer = async (args: FastDraftArgs): Promise<ParsedAnswerEnvelope> => {
   const { candidate, candidateName, selectedFolderLabels, resourceContext, problemMemory, invokeLlm } = args
+  const role = resolveRole(candidate)
   const intent = resolveIntent(candidate)
   const preferredFramework = resolveFramework(candidate, problemMemory)
   const preferredLanguage = resolveLanguage(candidate, problemMemory)
-  const prompt = `You are an interview copilot for coding interviews.
+  const prompt = `You are an interview copilot for ${
+    role === "product_manager" ? "Product Manager interviews" : "coding interviews"
+  }.
 
 Candidate: ${candidateName || "Candidate"}
 Question source: ${candidate.source === "interviewer" ? "Interviewer" : "User"}
+Role mode: ${role === "product_manager" ? "Product Manager" : "Developer"}
 Detected question: "${candidate.question}"
 Detected intent: ${intent}
 Detection confidence: ${Math.round(candidate.confidence * 100)}%
@@ -895,36 +976,43 @@ ${buildProblemMemoryContext(problemMemory || null) || "None"}
 Knowledge context:
 ${resourceContext || "No external resources."}
 
+${role === "product_manager"
+  ? `PM answer style:
+- Answer like a product manager, not an engineer.
+- Lead with the user problem, your recommendation, the tradeoff, and what you would measure.
+- Avoid code, APIs, and implementation details unless the question explicitly asks for them.`
+  : ""}
+
 Extracted understanding:
 - Problem statement: ${candidate.understanding.problemStatement}
 - Constraints: ${candidate.understanding.constraints.join("; ") || "none"}
 - Edge cases: ${candidate.understanding.edgeCases.join("; ") || "none"}
-- Preferred framework: ${preferredFramework || "unspecified"}
-- Preferred language: ${preferredLanguage || "unspecified"}
+${role === "product_manager" ? "" : `- Preferred framework: ${preferredFramework || "unspecified"}`}
+${role === "product_manager" ? "" : `- Preferred language: ${preferredLanguage || "unspecified"}`}
 
 Return STRICT JSON only:
 {
-  "answer": "${buildResponseContract(intent, preferredLanguage, preferredFramework)}",
+  "answer": "${buildResponseContract(role, intent, preferredLanguage, preferredFramework)}",
   "follow_ups": ["optional follow-up 1", "optional follow-up 2"],
   "question_understanding": {
-    "problemStatement": "normalized coding prompt",
+    "problemStatement": "${role === "product_manager" ? "normalized product question" : "normalized coding prompt"}",
     "constraints": ["constraint 1"],
     "edgeCases": ["edge case 1"]
   },
   "response_metadata": {
     "intent": "${intent}",
-    "language": "${preferredLanguage || "None"}",
-    "framework": "${preferredFramework || "None"}",
+    "language": "${role === "product_manager" ? "None" : preferredLanguage || "None"}",
+    "framework": "${role === "product_manager" ? "None" : preferredFramework || "None"}",
     "approach": "brief approach summary",
-    "time_complexity": "O(...) if relevant",
-    "space_complexity": "O(...) if relevant",
+    "time_complexity": "${role === "product_manager" ? "None" : "O(...) if relevant"}",
+    "space_complexity": "${role === "product_manager" ? "None" : "O(...) if relevant"}",
     "edge_cases": ["edge case 1"],
     "examples": ["optional example 1"]
   }
 }
 
 Rules:
-${buildIntentRules(intent, preferredLanguage, preferredFramework)
+${buildIntentRules(role, intent, preferredLanguage, preferredFramework)
   .map(rule => `- ${rule}`)
   .join("\n")}
 - Directly answer the request instead of describing what you would do.
@@ -937,19 +1025,21 @@ ${buildIntentRules(intent, preferredLanguage, preferredFramework)
     (preferredLanguage && isAnswerLanguageMismatch(parsed.answer, preferredLanguage, intent)) ||
     (preferredFramework && isAnswerFrameworkMismatch(parsed.answer, preferredFramework, intent))
   ) {
-    const correctedRaw = await invokeLlm(
-      buildLanguageCorrectionPrompt({
-        candidate,
-        answer: parsed.answer,
-        intent,
-        preferredLanguage,
-        preferredFramework,
-        resourceContext,
-        problemMemory,
-        jsonMode: true
-      })
-    )
-    parsed = parseAnswerEnvelope(correctedRaw, candidate, problemMemory)
+    if (role === "developer") {
+      const correctedRaw = await invokeLlm(
+        buildLanguageCorrectionPrompt({
+          candidate,
+          answer: parsed.answer,
+          intent,
+          preferredLanguage,
+          preferredFramework,
+          resourceContext,
+          problemMemory,
+          jsonMode: true
+        })
+      )
+      parsed = parseAnswerEnvelope(correctedRaw, candidate, problemMemory)
+    }
   }
 
   return parsed
@@ -957,10 +1047,13 @@ ${buildIntentRules(intent, preferredLanguage, preferredFramework)
 
 export const generateRefinedAnswer = async (args: RefineAnswerArgs): Promise<string> => {
   const { candidate, draftAnswer, suggestion, resourceContext, problemMemory, invokeLlm } = args
+  const role = resolveRole(candidate)
   const intent = resolveIntent(candidate)
   const preferredFramework = resolveFramework(candidate, problemMemory)
   const preferredLanguage = resolveLanguage(candidate, problemMemory)
-  const prompt = `You are an interview copilot.
+  const prompt = `You are an interview copilot for ${
+    role === "product_manager" ? "Product Manager interviews" : "coding interviews"
+  }.
 
 Original question:
 ${candidate.question}
@@ -983,11 +1076,18 @@ ${buildProblemMemoryContext(problemMemory || null) || "None"}
 Knowledge context:
 ${resourceContext || "No external resources."}
 
+${role === "product_manager"
+  ? `PM answer style:
+- Sound like a strong product manager.
+- Keep the answer user-centered, strategic, and metric-aware.
+- Avoid code or engineering implementation details unless explicitly requested.`
+  : ""}
+
 Return plain text only.
-${buildResponseContract(intent, preferredLanguage, preferredFramework)}
+${buildResponseContract(role, intent, preferredLanguage, preferredFramework)}
 
 Rules:
-${buildIntentRules(intent, preferredLanguage, preferredFramework)
+${buildIntentRules(role, intent, preferredLanguage, preferredFramework)
   .map(rule => `- ${rule}`)
   .join("\n")}
 - Improve the draft without making it longer than needed.
@@ -1000,20 +1100,22 @@ ${buildIntentRules(intent, preferredLanguage, preferredFramework)
     (preferredLanguage && isAnswerLanguageMismatch(refined, preferredLanguage, intent)) ||
     (preferredFramework && isAnswerFrameworkMismatch(refined, preferredFramework, intent))
   ) {
-    const correctedRaw = await invokeLlm(
-      buildLanguageCorrectionPrompt({
-        candidate,
-        answer: refined,
-        intent,
-        preferredLanguage,
-        preferredFramework,
-        resourceContext,
-        problemMemory,
-        jsonMode: false,
-        suggestion
-      })
-    )
-    refined = cleanLLMResponse(correctedRaw)
+    if (role === "developer") {
+      const correctedRaw = await invokeLlm(
+        buildLanguageCorrectionPrompt({
+          candidate,
+          answer: refined,
+          intent,
+          preferredLanguage,
+          preferredFramework,
+          resourceContext,
+          problemMemory,
+          jsonMode: false,
+          suggestion
+        })
+      )
+      refined = cleanLLMResponse(correctedRaw)
+    }
   }
 
   return refined
@@ -1045,6 +1147,7 @@ const parseQuality = (raw: string, fallback: AnswerQualityAnalytics): QualityJud
 
 export const judgeAnswerQuality = async (args: JudgeAnswerArgs): Promise<QualityJudgeResult> => {
   const { candidate, answer, problemMemory, invokeLlm } = args
+  const role = resolveRole(candidate)
   const intent = resolveIntent(candidate)
   const preferredFramework = resolveFramework(candidate, problemMemory)
   const preferredLanguage = resolveLanguage(candidate, problemMemory)
@@ -1055,7 +1158,9 @@ export const judgeAnswerQuality = async (args: JudgeAnswerArgs): Promise<Quality
     preferredLanguage,
     preferredFramework
   )
-  const prompt = `You are an independent answer quality judge.
+  const prompt = `You are an independent answer quality judge for ${
+    role === "product_manager" ? "Product Manager interview answers" : "coding interview answers"
+  }.
 Return STRICT JSON only.
 
 Question:
@@ -1095,7 +1200,7 @@ Scoring guide:
 - relevance: directly satisfies the user's request
 - If a specific programming language was requested, using a different language is a major relevance failure.
 - If a specific framework was requested, using a different framework is a major relevance failure.
-${buildJudgeRules(intent)
+${buildJudgeRulesForRole(role, intent)
   .map(rule => `- ${rule}`)
   .join("\n")}`
 

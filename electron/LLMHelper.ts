@@ -31,7 +31,7 @@ interface GroqChatResponse {
 }
 
 const DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-const DEFAULT_GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
+const DEFAULT_GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
 const DEFAULT_GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
 
 export class LLMHelper {
@@ -152,6 +152,15 @@ Default behavior:
       const body = (await response.json()) as GroqChatResponse
       if (!response.ok) {
         const message = body?.error?.message || `Groq API error: ${response.status}`
+        if (/model.*(?:does not exist|do not have access|decommissioned|deprecated)/i.test(message)) {
+          const hasImages = messages.some(({ content }) =>
+            Array.isArray(content) && content.some((part) => part.type === "image_url")
+          )
+          const setting = hasImages ? "GROQ_VISION_MODEL" : "GROQ_MODEL"
+          throw new Error(
+            `${message} Set ${setting} in .env to a model available to your Groq project, then restart the app. See https://console.groq.com/docs/models.`
+          )
+        }
         if (attempt < maxRetries && this.isGroqRateLimit(response.status, message)) {
           const retryDelayMs = this.getGroqRetryDelayMs(message, attempt)
           console.warn(

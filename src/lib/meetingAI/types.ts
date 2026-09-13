@@ -1,6 +1,7 @@
 import type { AnswerQualityAnalytics, CodingQuestionUnderstanding } from "../meetingsStore"
 
 export type MeetingAudioSource = "user" | "interviewer"
+export type MeetingRole = "developer" | "product_manager"
 
 export type CodingIntent =
   | "theory"
@@ -65,6 +66,7 @@ export interface QuestionCandidate {
   id: string
   question: string
   source: MeetingAudioSource
+  role?: MeetingRole
   confidence: number
   contextWindow: string
   detectedAt: number

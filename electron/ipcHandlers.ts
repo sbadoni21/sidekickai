@@ -976,6 +976,13 @@ export function initializeIpcHandlers(appState: AppState): void {
     lastFinalAt = 0
   }
 
+  const clearMeetingContextBuffers = () => {
+    clearPcmQueues()
+    clearChunkBuffers()
+    lastFinalSignature = ""
+    lastFinalAt = 0
+  }
+
   const ensureQueueFlushTimer = () => {
     if (queueFlushTimer) return
     queueFlushTimer = setInterval(() => {
@@ -1798,6 +1805,43 @@ export function initializeIpcHandlers(appState: AppState): void {
         droppedAudioChunks,
         avgSttLatencyMs: getAverageSttLatency()
       }
+    }
+  })
+
+  ipcMain.handle("meeting:clear-context", async () => {
+    try {
+      const meeting = appState.getCurrentMeeting()
+      if (!meeting) return { success: false, error: "No active meeting" }
+
+      meeting.transcripts = []
+      meeting.analytics = {
+        ...(meeting.analytics || {}),
+        transcriptSegments: [],
+        detectedQuestions: [],
+        answers: [],
+        controls: meeting.analytics?.controls || {
+          cpuMode: "balanced",
+          chunkRateMs: CHUNK_FALLBACK_WINDOW_MS,
+          maxChunkQueue: MAX_PCM_QUEUE_CHUNKS,
+          answerThrottleMs: 1200,
+          modelThrottleMs: 800,
+          cloudOffload: false
+        },
+        performance: meeting.analytics?.performance || {
+          droppedAudioChunks,
+          queueHighWaterMark,
+          reconnectCount,
+          fallbackCount,
+          avgSttLatencyMs: getAverageSttLatency()
+        }
+      }
+
+      clearMeetingContextBuffers()
+      emitSttStatus("meeting-context-cleared")
+
+      return { success: true, meeting }
+    } catch (error: any) {
+      return { success: false, error: error.message }
     }
   })
 

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { MessageSquare, Mic, MicOff, Pause, Play, Terminal, X } from "lucide-react";
+import { BriefcaseBusiness, MessageSquare, Mic, MicOff, Pause, Play, Terminal, X } from "lucide-react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { dracula } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { cleanLLMResponse, parseLLMResponse } from "../../utils/lmResponseParser";
@@ -26,8 +26,8 @@ import {
   buildProblemMemoryContext,
   buildProblemMemoryPatchFromCandidate,
   buildScreenProblemExtractionPrompt,
-  inferCodingIntent,
   inferFrameworkFromText,
+  inferMeetingIntent,
   inferLanguageFromText,
   isCodeHeavyIntent,
   mergeProblemMemory,
@@ -38,6 +38,7 @@ import {
 import type {
   AnswerResponseMetadata,
   CodingIntent,
+  MeetingRole,
   ProblemMemory
 } from "../../lib/meetingAI/types";
 import { buildHybridResourceContext } from "../../lib/meetingAI/ragContext";
@@ -117,6 +118,7 @@ interface AnswerSuggestion {
   id: string;
   questionId?: string;
   question: string;
+  role?: MeetingRole;
   response?: string;
   status: "pending" | "ready" | "error";
   stage?: "draft" | "refined";
@@ -153,6 +155,7 @@ interface QuestionCandidate {
   id: string;
   question: string;
   source: MeetingAudioSource;
+  role?: MeetingRole;
   confidence: number;
   contextWindow: string;
   detectedAt: number;
@@ -200,6 +203,7 @@ const DEFAULT_RESOURCE_SCOPE_SELECTION: ResourceScopeSelection = {
 };
 
 const RESOURCE_SCOPE_KEY_PREFIX = "cluely_meeting_resource_scope_v1_";
+const MEETING_ROLE_KEY_PREFIX = "cluely_meeting_role_v1_";
 
 type MeetingSttProviderChoice = "auto" | "elevenlabs" | "google" | "groq" | "puter";
 type AnswerCaptureMode = "auto" | "manual";
@@ -211,6 +215,17 @@ const CONTEXTUAL_EXPLANATION_REGEX =
   /^(and|also|then|what about|how about|plus|one more|another|more|more details?|explain more|go deeper|elaborate)\b/i;
 const CONTEXT_DEPENDENT_QUESTION_REGEX =
   /^(it|that|this|same|same thing|same one|the same|do it|continue|next|now|for this)\b/i;
+
+const normalizeMeetingRole = (value: unknown): MeetingRole =>
+  value === "product_manager" ? "product_manager" : "developer";
+
+const getMeetingRoleLabel = (role: MeetingRole): string =>
+  role === "product_manager" ? "Product Manager" : "Developer";
+
+const getMeetingRoleDescription = (role: MeetingRole): string =>
+  role === "product_manager"
+    ? "Answers product sense, prioritization, roadmap, metrics, launches, and stakeholder questions."
+    : "Answers coding, debugging, system design, and software engineering interview questions.";
 
 const normalizeSttProviderChoice = (value: unknown): MeetingSttProviderChoice => {
   if (
@@ -283,6 +298,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [answers, setAnswers] = useState<AnswerSuggestion[]>([]);
   const [isScreenAnswering, setIsScreenAnswering] = useState(false);
+  const [isClearingContext, setIsClearingContext] = useState(false);
   const [sttStatus, setSttStatus] = useState<SttStatusPayload | null>(null);
   const [isEndingMeeting, setIsEndingMeeting] = useState(false);
   const [isMicEnabled, setIsMicEnabled] = useState(true);
@@ -297,6 +313,16 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       return normalizeSttProviderChoice(raw);
     } catch {
       return "auto";
+    }
+  });
+  const [meetingRole, setMeetingRole] = useState<MeetingRole>(() => {
+    try {
+      const user = getCurrentUser();
+      if (!user) return "developer";
+      const raw = localStorage.getItem(`${MEETING_ROLE_KEY_PREFIX}${user.id}`);
+      return normalizeMeetingRole(raw);
+    } catch {
+      return "developer";
     }
   });
   const [answerCaptureMode, setAnswerCaptureMode] = useState<AnswerCaptureMode>("auto");
@@ -339,6 +365,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const puterScriptPromiseRef = useRef<Promise<void> | null>(null);
   const puterReadyRef = useRef(false);
   const answerCaptureModeRef = useRef<AnswerCaptureMode>("auto");
+  const contextVersionRef = useRef(0);
   const lastTranscriptSignatureRef = useRef<{ signature: string; timestamp: number } | null>(null);
   const manualQuestionRecordingRef = useRef(false);
   const manualQuestionFinalizingRef = useRef(false);
@@ -620,6 +647,37 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     };
   };
 
+  const buildDefaultPerformanceSnapshot = (): MeetingPerformanceSnapshot => ({
+    droppedAudioChunks: 0,
+    queueHighWaterMark: 0,
+    reconnectCount: 0,
+    fallbackCount: 0,
+    avgSttLatencyMs: 0
+  });
+
+  const buildMeetingAnalytics = (options?: { preservePerformance?: boolean }): MeetingAnalytics => ({
+    transcriptSegments: [],
+    detectedQuestions: [],
+    answers: [],
+    controls: {
+      cpuMode,
+      chunkRateMs,
+      maxChunkQueue,
+      answerThrottleMs,
+      modelThrottleMs,
+      cloudOffload
+    },
+    performance: options?.preservePerformance
+      ? {
+          droppedAudioChunks: analyticsRef.current.performance?.droppedAudioChunks || 0,
+          queueHighWaterMark: analyticsRef.current.performance?.queueHighWaterMark || 0,
+          reconnectCount: analyticsRef.current.performance?.reconnectCount || 0,
+          fallbackCount: analyticsRef.current.performance?.fallbackCount || 0,
+          avgSttLatencyMs: analyticsRef.current.performance?.avgSttLatencyMs || 0
+        }
+      : buildDefaultPerformanceSnapshot()
+  });
+
   const syncMeetingAnalytics = async (immediate = false) => {
     const runSync = async () => {
       try {
@@ -654,6 +712,121 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const updateAnalyticsRef = (updater: (current: MeetingAnalytics) => MeetingAnalytics) => {
     analyticsRef.current = updater(analyticsRef.current);
     syncMeetingAnalytics(false).catch(() => undefined);
+  };
+
+  const clearLocalMeetingContext = (options?: { preservePerformance?: boolean }) => {
+    contextVersionRef.current += 1;
+    answerInFlightRef.current = false;
+    questionClassificationInFlightRef.current = false;
+    pendingAnswerRef.current = null;
+    pendingDetectionRef.current = null;
+    lastAnsweredRef.current = null;
+    lastQuestionSignatureRef.current = null;
+    lastQuestionTimestampRef.current = 0;
+    lastTranscriptSignatureRef.current = null;
+    transcriptHistoryRef.current = [];
+    chunkQueueRef.current = [];
+    modelLastCallAtRef.current = 0;
+    answerLastStartedAtRef.current = 0;
+    manualQuestionRecordingRef.current = false;
+    manualQuestionFinalizingRef.current = false;
+    manualQuestionSegmentsRef.current = [];
+    if (questionDebounceRef.current) {
+      clearTimeout(questionDebounceRef.current);
+      questionDebounceRef.current = null;
+    }
+    if (manualQuestionFinalizeTimerRef.current) {
+      clearTimeout(manualQuestionFinalizeTimerRef.current);
+      manualQuestionFinalizeTimerRef.current = null;
+    }
+
+    const nextAnalytics = buildMeetingAnalytics(options);
+    analyticsRef.current = nextAnalytics;
+
+    setAnswers([]);
+    setTypedQuestionInput("");
+    setLiveTranscript(null);
+    setPartialTranscript(null);
+    setIsScreenAnswering(false);
+    setIsManualQuestionRecording(false);
+    setIsManualQuestionProcessing(false);
+    updateManualQuestionPreview("");
+    updateProblemMemory(null, { replace: true });
+    setError(null);
+    setMeeting((prev) =>
+      prev
+        ? {
+            ...prev,
+            transcripts: [],
+            analytics: nextAnalytics
+          }
+        : prev
+    );
+  };
+
+  const resetAnsweringStateForRoleSwitch = () => {
+    contextVersionRef.current += 1;
+    answerInFlightRef.current = false;
+    questionClassificationInFlightRef.current = false;
+    pendingAnswerRef.current = null;
+    pendingDetectionRef.current = null;
+    lastAnsweredRef.current = null;
+    lastQuestionSignatureRef.current = null;
+    lastQuestionTimestampRef.current = 0;
+    modelLastCallAtRef.current = 0;
+    answerLastStartedAtRef.current = 0;
+    manualQuestionRecordingRef.current = false;
+    manualQuestionFinalizingRef.current = false;
+    manualQuestionSegmentsRef.current = [];
+    if (questionDebounceRef.current) {
+      clearTimeout(questionDebounceRef.current);
+      questionDebounceRef.current = null;
+    }
+    if (manualQuestionFinalizeTimerRef.current) {
+      clearTimeout(manualQuestionFinalizeTimerRef.current);
+      manualQuestionFinalizeTimerRef.current = null;
+    }
+    setIsManualQuestionRecording(false);
+    setIsManualQuestionProcessing(false);
+    updateManualQuestionPreview("");
+    setTypedQuestionInput("");
+    setLiveTranscript(null);
+    setPartialTranscript(null);
+    updateProblemMemory(null, { replace: true });
+    setError(null);
+  };
+
+  const handleMeetingRoleChange = (nextRole: MeetingRole) => {
+    if (nextRole === meetingRole) return;
+    setMeetingRole(nextRole);
+
+    if (meetingStateRef.current.isRecording) {
+      resetAnsweringStateForRoleSwitch();
+      addLog(
+        "info",
+        `🧭 Switched answer mode to ${getMeetingRoleLabel(nextRole)}. New questions will use ${getMeetingRoleDescription(nextRole).toLowerCase()}`
+      );
+    }
+  };
+
+  const handleClearMeetingContext = async () => {
+    if (!meetingStateRef.current.isRecording || isClearingContext) return;
+
+    setIsClearingContext(true);
+    try {
+      const result = await window.electronAPI.meeting.clearContext();
+      if (!result.success) {
+        throw new Error(result.error || "Failed to clear meeting context.");
+      }
+
+      clearLocalMeetingContext({ preservePerformance: true });
+      addLog("success", "🧹 Cleared meeting conversation and AI context.");
+    } catch (clearError: any) {
+      addLog("error", `❌ Failed to clear meeting context: ${clearError?.message || "unknown error"}`);
+      setError(clearError?.message || "Failed to clear meeting context.");
+    } finally {
+      setIsClearingContext(false);
+    }
   };
 
   useEffect(() => {
@@ -781,7 +954,10 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
 
     let resolvedQuestion = originalQuestion;
     if (CONTEXTUAL_CODE_REQUEST_REGEX.test(originalQuestion)) {
-      resolvedQuestion = `Give a code example for: ${anchor}`;
+      resolvedQuestion =
+        meetingRole === "product_manager"
+          ? `Give a concrete product example for: ${anchor}`
+          : `Give a code example for: ${anchor}`;
     } else if (CONTEXTUAL_EXPLANATION_REGEX.test(originalQuestion)) {
       resolvedQuestion = `Explain in more detail: ${anchor}`;
     } else {
@@ -795,7 +971,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       ...candidate,
       question: resolvedQuestion,
       contextWindow,
-      understanding: buildQuestionUnderstanding(resolvedQuestion, contextWindow)
+      understanding: buildQuestionUnderstanding(resolvedQuestion, contextWindow, meetingRole)
     };
   };
 
@@ -806,11 +982,14 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     return {
       ...candidate,
       contextWindow,
-      understanding: buildQuestionUnderstanding(candidate.question, contextWindow)
+      understanding: buildQuestionUnderstanding(candidate.question, contextWindow, meetingRole)
     };
   };
 
   const resolveCandidateLanguage = (candidate: QuestionCandidate): string | undefined =>
+    meetingRole === "product_manager"
+      ? undefined
+      :
     normalizeLanguageLabel(
       candidate.languageHint ||
         problemMemoryRef.current?.preferredLanguage ||
@@ -820,6 +999,9 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     );
 
   const resolveCandidateFramework = (candidate: QuestionCandidate): string | undefined =>
+    meetingRole === "product_manager"
+      ? undefined
+      :
     normalizeFrameworkLabel(
       candidate.frameworkHint ||
         problemMemoryRef.current?.preferredFramework ||
@@ -845,7 +1027,8 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     response: string
   ) => {
     const parsed = parseLLMResponse(response);
-    const activeIntent = metadata?.intent || candidate.intent || inferCodingIntent(candidate.question, candidate.contextWindow);
+    const activeIntent =
+      metadata?.intent || candidate.intent || inferMeetingIntent(candidate.question, candidate.contextWindow, meetingRole);
     updateProblemMemory({
       preferredLanguage: normalizeLanguageLabel(
         resolveCandidateLanguage(candidate) || problemMemoryRef.current?.preferredLanguage || metadata?.language
@@ -874,7 +1057,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     const enrichedCandidate = ensureExplicitQuestionTranscriptContext(enrichQuestionWithContext(candidate));
     let resolvedCandidate: QuestionCandidate = {
       ...enrichedCandidate,
-      intent: enrichedCandidate.intent || inferCodingIntent(enrichedCandidate.question, enrichedCandidate.contextWindow)
+      intent: enrichedCandidate.intent || inferMeetingIntent(enrichedCandidate.question, enrichedCandidate.contextWindow, meetingRole)
     };
 
     if (
@@ -886,7 +1069,8 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         await applyModelThrottle();
         const modelClassification = await classifyQuestionIntentWithModel(
           enrichedCandidate,
-          (prompt) => window.electronAPI.invoke("llm-chat", prompt)
+          (prompt) => window.electronAPI.invoke("llm-chat", prompt),
+          meetingRole
         );
 
         resolvedCandidate = {
@@ -909,7 +1093,8 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
 
     return {
       ...resolvedCandidate,
-      intent: resolvedCandidate.intent || inferCodingIntent(resolvedCandidate.question, resolvedCandidate.contextWindow),
+      intent:
+        resolvedCandidate.intent || inferMeetingIntent(resolvedCandidate.question, resolvedCandidate.contextWindow, meetingRole),
       languageHint: resolveCandidateLanguage(resolvedCandidate),
       frameworkHint: resolveCandidateFramework(resolvedCandidate)
     };
@@ -966,13 +1151,22 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
     }
   };
 
-  const DEFAULT_EXPANSION_SUGGESTIONS = [
-    "Add more details",
-    "Give a short code example",
-    "Mention pitfalls and edge cases"
-  ];
+  const getDefaultExpansionSuggestions = (): string[] =>
+    meetingRole === "product_manager"
+      ? ["Add more detail", "Give a concrete PM example", "Mention tradeoffs and metrics"]
+      : ["Add more details", "Give a short code example", "Mention pitfalls and edge cases"];
 
   const getIntentSpecificSuggestions = (intent?: CodingIntent): string[] => {
+    if (meetingRole === "product_manager") {
+      if (intent === "behavioral") {
+        return ["Make it more STAR", "Add the measurable outcome", "Mention stakeholder alignment"];
+      }
+      if (intent === "system_design") {
+        return ["Add prioritization tradeoffs", "Mention success metrics", "Call out risks and dependencies"];
+      }
+      return ["Add user pain point", "Mention one metric", "Add a tradeoff"];
+    }
+
     if (intent === "write_code" || intent === "debug_code") {
       return ["Explain the code briefly", "Add test cases", "Show time and space complexity"];
     }
@@ -994,7 +1188,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   const getExpansionSuggestions = (item: AnswerSuggestion): string[] => {
     const byKey = new Map<string, string>();
     [
-      ...DEFAULT_EXPANSION_SUGGESTIONS,
+      ...getDefaultExpansionSuggestions(),
       ...getIntentSpecificSuggestions(item.responseMetadata?.intent || item.intent),
       ...(item.followUps || [])
     ].forEach((entry) => {
@@ -1038,6 +1232,16 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   };
 
   const getAutoRefinementGoal = (intent?: CodingIntent): string => {
+    if (meetingRole === "product_manager") {
+      if (intent === "behavioral") {
+        return "Tighten the story into a crisp STAR answer with a clear result.";
+      }
+      if (intent === "system_design") {
+        return "Make the recommendation more structured with user impact, tradeoffs, metric, and risk.";
+      }
+      return "Make the PM answer sharper, more user-focused, and more measurable.";
+    }
+
     if (intent === "write_code") {
       return "Tighten the code example, then add only the most important explanation, complexity, and edge case.";
     }
@@ -1070,7 +1274,9 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   };
 
   const generateAnswer = async (candidate: QuestionCandidate) => {
+    const contextVersion = contextVersionRef.current;
     const resolvedCandidate = await resolveCandidateForAnswer(candidate);
+    if (contextVersion !== contextVersionRef.current) return;
     const trimmed = resolvedCandidate.question.trim();
     if (!trimmed) return;
     if (lastAnsweredRef.current === normalizeQuestionSignature(trimmed)) return;
@@ -1105,6 +1311,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
       id: answerId,
       questionId: resolvedCandidate.id,
       question: trimmed,
+      role: resolvedCandidate.role || meetingRole,
       status: "pending",
       stage: "draft",
       isRefining: false,
@@ -1142,6 +1349,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         problemMemory: problemMemoryRef.current,
         invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
       });
+      if (contextVersion !== contextVersionRef.current) return;
       const draftLatencyMs = Date.now() - draftStartedAt;
       const draftAnswer = cleanLLMResponse(parsedDraft.answer);
       syncProblemMemoryFromAnswer(resolvedCandidate, parsedDraft.metadata, draftAnswer);
@@ -1177,6 +1385,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
                 draftLatencyMs,
                 provider: config.provider,
                 model: config.model,
+                role: resolvedCandidate.role || meetingRole,
                 intent: resolvedCandidate.intent,
                 languageHint: resolvedCandidate.languageHint,
                 frameworkHint: resolvedCandidate.frameworkHint,
@@ -1201,6 +1410,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         quality: draftQuality
       });
     } catch (err: any) {
+      if (contextVersion !== contextVersionRef.current) return;
       setAnswers((prev) =>
         prev.map((item) =>
           item.id === answerId
@@ -1209,6 +1419,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         )
       );
     } finally {
+      if (contextVersion !== contextVersionRef.current) return;
       answerInFlightRef.current = false;
       const pending = pendingAnswerRef.current;
       pendingAnswerRef.current = null;
@@ -1219,22 +1430,28 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
   };
 
   const requestAnswerRefinement = async (answerId: string) => {
+    const contextVersion = contextVersionRef.current;
     const selectedAnswer = answers.find((item) => item.id === answerId);
     if (!selectedAnswer || selectedAnswer.status !== "ready" || !selectedAnswer.response || selectedAnswer.isRefining) {
       return;
     }
 
-    const answerIntent = selectedAnswer.responseMetadata?.intent || selectedAnswer.intent || inferCodingIntent(selectedAnswer.question);
     const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
+    const answerRole = selectedAnswer.role || meetingRole;
+    const answerIntent =
+      selectedAnswer.responseMetadata?.intent ||
+      selectedAnswer.intent ||
+      inferMeetingIntent(selectedAnswer.question, contextWindow, answerRole);
     const refinementCandidate: QuestionCandidate = {
       id: selectedAnswer.questionId || `refine-${answerId}`,
       question: selectedAnswer.question,
       source: "user",
+      role: answerRole,
       confidence: Math.max((selectedAnswer.confidence || 80) / 100, 0.6),
       contextWindow,
       detectedAt: Date.now(),
       understanding:
-        selectedAnswer.understanding || buildQuestionUnderstanding(selectedAnswer.question, contextWindow),
+        selectedAnswer.understanding || buildQuestionUnderstanding(selectedAnswer.question, contextWindow, answerRole),
       intent: answerIntent,
       languageHint: normalizeLanguageLabel(
         selectedAnswer.responseMetadata?.language || selectedAnswer.languageHint || problemMemoryRef.current?.preferredLanguage
@@ -1276,6 +1493,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         problemMemory: problemMemoryRef.current,
         invokeLlm: (prompt) => window.electronAPI.invoke("llm-chat", prompt)
       });
+      if (contextVersion !== contextVersionRef.current) return;
       const refineLatencyMs = Date.now() - refineStartedAt;
       syncProblemMemoryFromAnswer(refinementCandidate, selectedAnswer.responseMetadata, refinedAnswer);
       const refinedQuality = estimateAnswerQuality(refinementCandidate, refinedAnswer, problemMemoryRef.current);
@@ -1321,6 +1539,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
         quality: refinedQuality
       });
     } catch (error: any) {
+      if (contextVersion !== contextVersionRef.current) return;
       const message = error?.message || "Failed to refine answer.";
       setAnswers((prev) =>
         prev.map((item) =>
@@ -1368,14 +1587,30 @@ const MeetingMode: React.FC<MeetingModeProps> = ({
 
       const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
       const { context } = await buildResourceContext(`${selectedAnswer.question} ${normalizedSuggestion}`);
-      const answerIntent = selectedAnswer.responseMetadata?.intent || selectedAnswer.intent || inferCodingIntent(selectedAnswer.question);
-      const preferredLanguage = normalizeLanguageLabel(
-        selectedAnswer.responseMetadata?.language || selectedAnswer.languageHint || problemMemoryRef.current?.preferredLanguage
-      );
-      const preferredFramework = normalizeFrameworkLabel(
-        selectedAnswer.responseMetadata?.framework || selectedAnswer.frameworkHint || problemMemoryRef.current?.preferredFramework
-      );
-      const prompt = `You are an interview copilot.
+      const answerRole = selectedAnswer.role || meetingRole;
+      const answerIntent =
+        selectedAnswer.responseMetadata?.intent ||
+        selectedAnswer.intent ||
+        inferMeetingIntent(selectedAnswer.question, contextWindow, answerRole);
+      const preferredLanguage =
+        answerRole === "product_manager"
+          ? undefined
+          : normalizeLanguageLabel(
+              selectedAnswer.responseMetadata?.language ||
+                selectedAnswer.languageHint ||
+                problemMemoryRef.current?.preferredLanguage
+            );
+      const preferredFramework =
+        answerRole === "product_manager"
+          ? undefined
+          : normalizeFrameworkLabel(
+              selectedAnswer.responseMetadata?.framework ||
+                selectedAnswer.frameworkHint ||
+                problemMemoryRef.current?.preferredFramework
+            );
+      const prompt = `You are an interview copilot for ${
+        answerRole === "product_manager" ? "Product Manager interviews" : "coding interviews"
+      }.
 
 Original interview question:
 ${selectedAnswer.question}
@@ -1395,17 +1630,26 @@ ${contextWindow || "No recent context."}
 Active problem memory:
 ${buildProblemMemoryContext(problemMemoryRef.current) || "None"}
 
-Preferred language:
+${answerRole === "product_manager"
+  ? `PM answer style:
+- Answer like a product manager, not an engineer.
+- Lead with user impact, recommendation, tradeoff, and metric.
+- Avoid code or implementation details unless explicitly requested.`
+  : `Preferred language:
 ${preferredLanguage || "unspecified"}
 
 Preferred framework:
-${preferredFramework || "unspecified"}
+${preferredFramework || "unspecified"}`}
 
 Candidate resources:
 ${context || "No resources provided."}
 
 Return plain text only. Keep it concise, interview-ready, and actionable.
-If coding-related, preserve the original language and framework and include quick complexity and one edge case.`;
+${
+  answerRole === "product_manager"
+    ? "If helpful, mention the user impact, one tradeoff, and one metric or risk."
+    : "If coding-related, preserve the original language and framework and include quick complexity and one edge case."
+}`;
 
       const raw = await window.electronAPI.invoke("llm-chat", prompt);
       const expanded = cleanLLMResponse(coerceLlmResponseText(raw));
@@ -1442,6 +1686,11 @@ If coding-related, preserve the original language and framework and include quic
 
   const handleAnswerFromScreen = async () => {
     if (isScreenAnswering) return;
+    if (meetingRole === "product_manager") {
+      addLog("warning", "⚠️ Screen answer is currently optimized for Developer mode only.");
+      return;
+    }
+    const contextVersion = contextVersionRef.current;
     setIsScreenAnswering(true);
 
     const contextWindow = appendLastAskedTranscriptContext(buildConversationContext(8));
@@ -1468,9 +1717,10 @@ If coding-related, preserve the original language and framework and include quic
         "llm-chat",
         buildScreenProblemExtractionPrompt(screenSummary, contextWindow, problemMemoryRef.current)
       );
+      if (contextVersion !== contextVersionRef.current) return;
       const extracted = parseScreenProblemAnalysis(coerceLlmResponseText(extractionRaw), {
         activeRequest: "Help me solve the visible coding problem",
-        intent: inferCodingIntent(screenSummary, contextWindow),
+        intent: inferMeetingIntent(screenSummary, contextWindow, meetingRole),
         problemStatement: problemMemoryRef.current?.problemStatement || screenSummary,
         preferredLanguage: inferLanguageFromText(
           `${screenSummary}\n${problemMemoryRef.current?.preferredLanguage || ""}`
@@ -1485,7 +1735,7 @@ If coding-related, preserve the original language and framework and include quic
 
       const inferredIntent =
         extracted.intent === "other"
-          ? inferCodingIntent(extracted.activeRequest || extracted.problemStatement, screenSummary)
+          ? inferMeetingIntent(extracted.activeRequest || extracted.problemStatement, screenSummary, meetingRole)
           : extracted.intent;
       const languageHint = normalizeLanguageLabel(
         extracted.preferredLanguage || problemMemoryRef.current?.preferredLanguage
@@ -1533,11 +1783,12 @@ If coding-related, preserve the original language and framework and include quic
         detectedAt: Date.now(),
         understanding: {
           problemStatement:
-            extracted.problemStatement || buildQuestionUnderstanding(fallbackQuestion, contextWindow).problemStatement,
+            extracted.problemStatement || buildQuestionUnderstanding(fallbackQuestion, contextWindow, meetingRole).problemStatement,
           constraints: extracted.constraints,
           edgeCases: extracted.edgeCases
         },
         intent: inferredIntent,
+        role: meetingRole,
         languageHint,
         frameworkHint
       };
@@ -1551,11 +1802,14 @@ If coding-related, preserve the original language and framework and include quic
         )}`
       );
       await generateAnswer(screenCandidate);
+      if (contextVersion !== contextVersionRef.current) return;
       addLog("success", "🖼️ Screen analyzed and answer generated.");
     } catch (error: any) {
+      if (contextVersion !== contextVersionRef.current) return;
       const message = error?.message || "Failed to answer from screen.";
       addLog("error", `❌ Screen answer failed: ${message}`);
     } finally {
+      if (contextVersion !== contextVersionRef.current) return;
       setIsScreenAnswering(false);
     }
   };
@@ -1734,6 +1988,7 @@ If coding-related, preserve the original language and framework and include quic
   };
 
   const flushDetectedQuestion = async () => {
+    const contextVersion = contextVersionRef.current;
     if (isManualCaptureMode()) {
       pendingDetectionRef.current = null;
       return;
@@ -1746,8 +2001,12 @@ If coding-related, preserve the original language and framework and include quic
 
     try {
       const classifiedCandidate = await resolveCandidateForAnswer(pending);
+      if (contextVersion !== contextVersionRef.current) return;
 
-      const threshold = getQuestionDetectionThreshold(classifiedCandidate.question);
+      const threshold = getQuestionDetectionThreshold(
+        classifiedCandidate.question,
+        classifiedCandidate.role || meetingRole
+      );
       if (classifiedCandidate.confidence < threshold) {
         addLog(
           "info",
@@ -1787,6 +2046,7 @@ If coding-related, preserve the original language and framework and include quic
       if (isManualCaptureMode()) return;
       generateAnswer(classifiedCandidate);
     } finally {
+      if (contextVersion !== contextVersionRef.current) return;
       questionClassificationInFlightRef.current = false;
     }
   };
@@ -1799,7 +2059,8 @@ If coding-related, preserve the original language and framework and include quic
     const candidateFromPayload = buildHeuristicQuestionCandidate(
       payload.text,
       payload.source,
-      appendLastAskedTranscriptContext(buildConversationContext(6))
+      appendLastAskedTranscriptContext(buildConversationContext(6)),
+      meetingRole
     );
     const recentMergedText = transcriptHistoryRef.current
       .slice(-4)
@@ -1810,7 +2071,8 @@ If coding-related, preserve the original language and framework and include quic
       ? buildHeuristicQuestionCandidate(
           recentMergedText,
           payload.source,
-          appendLastAskedTranscriptContext(buildConversationContext(8))
+          appendLastAskedTranscriptContext(buildConversationContext(8)),
+          meetingRole
         )
       : null;
     const candidate =
@@ -1834,7 +2096,8 @@ If coding-related, preserve the original language and framework and include quic
       const mergedCandidate = buildHeuristicQuestionCandidate(
         mergedQuestion,
         candidate.source,
-        mergedContext
+        mergedContext,
+        meetingRole
       );
       pendingDetectionRef.current = mergedCandidate
         ? {
@@ -1966,11 +2229,12 @@ If coding-related, preserve the original language and framework and include quic
       id: `manual-${detectedAt}`,
       question,
       source: "user",
+      role: meetingRole,
       confidence: 1,
       contextWindow,
       detectedAt,
-      understanding: buildQuestionUnderstanding(question, contextWindow),
-      intent: inferCodingIntent(question, contextWindow),
+      understanding: buildQuestionUnderstanding(question, contextWindow, meetingRole),
+      intent: inferMeetingIntent(question, contextWindow, meetingRole),
       languageHint: normalizeLanguageLabel(
         inferLanguageFromText(`${question}\n${contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`)
       ),
@@ -2042,11 +2306,12 @@ If coding-related, preserve the original language and framework and include quic
       id: `typed-${detectedAt}`,
       question,
       source: "user",
+      role: meetingRole,
       confidence: 1,
       contextWindow,
       detectedAt,
-      understanding: buildQuestionUnderstanding(question, contextWindow),
-      intent: inferCodingIntent(question, contextWindow),
+      understanding: buildQuestionUnderstanding(question, contextWindow, meetingRole),
+      intent: inferMeetingIntent(question, contextWindow, meetingRole),
       languageHint: normalizeLanguageLabel(
         inferLanguageFromText(`${question}\n${contextWindow}\n${buildProblemMemoryContext(problemMemoryRef.current)}`)
       ),
@@ -2264,6 +2529,16 @@ If coding-related, preserve the original language and framework and include quic
   }, [selectedSttProvider]);
 
   useEffect(() => {
+    const user = getCurrentUser();
+    if (!user) return;
+    try {
+      localStorage.setItem(`${MEETING_ROLE_KEY_PREFIX}${user.id}`, meetingRole);
+    } catch {
+      // no-op
+    }
+  }, [meetingRole]);
+
+  useEffect(() => {
     if (resolvedSttProvider !== "puter") return;
     ensurePuterSdk().catch((error: any) => {
       addLog("warning", `⚠️ Puter SDK not ready: ${error?.message || "unknown error"}`);
@@ -2400,6 +2675,10 @@ If coding-related, preserve the original language and framework and include quic
       setPartialTranscript(null);
       setAnswers([]);
       setTypedQuestionInput("");
+      setIsScreenAnswering(false);
+      contextVersionRef.current += 1;
+      answerInFlightRef.current = false;
+      questionClassificationInFlightRef.current = false;
       updateProblemMemory(null, { replace: true });
       setIsMicEnabled(true);
       micEnabledRef.current = true;
@@ -2426,26 +2705,7 @@ If coding-related, preserve the original language and framework and include quic
       setIsManualQuestionRecording(false);
       setIsManualQuestionProcessing(false);
       updateManualQuestionPreview("");
-      analyticsRef.current = {
-        transcriptSegments: [],
-        detectedQuestions: [],
-        answers: [],
-        controls: {
-          cpuMode,
-          chunkRateMs,
-          maxChunkQueue,
-          answerThrottleMs,
-          modelThrottleMs,
-          cloudOffload
-        },
-        performance: {
-          droppedAudioChunks: 0,
-          queueHighWaterMark: 0,
-          reconnectCount: 0,
-          fallbackCount: 0,
-          avgSttLatencyMs: 0
-        }
-      };
+      analyticsRef.current = buildMeetingAnalytics();
       if (questionDebounceRef.current) {
         clearTimeout(questionDebounceRef.current);
         questionDebounceRef.current = null;
@@ -2467,6 +2727,7 @@ If coding-related, preserve the original language and framework and include quic
       } else {
         addLog("info", `📚 Active folders: ${getSelectedFolderLabels().join(", ")}`);
       }
+      addLog("info", `🧭 Meeting role: ${getMeetingRoleLabel(meetingRole)}`);
 
       if (resolvedSttProvider === "puter") {
         await ensurePuterSdk();
@@ -2894,7 +3155,42 @@ If coding-related, preserve the original language and framework and include quic
 
         <div className="meeting-section mb-4 rounded-xl p-3">
           <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-700">
-            RAG Folders (for interview answers)
+            Interview Role
+          </div>
+          <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 text-xs font-semibold">
+            <button
+              type="button"
+              onClick={() => handleMeetingRoleChange("developer")}
+              className={`rounded-lg px-3 py-1.5 transition ${
+                meetingRole === "developer"
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-slate-600 hover:bg-slate-100"
+              }`}
+            >
+              Developer
+            </button>
+            <button
+              type="button"
+              onClick={() => handleMeetingRoleChange("product_manager")}
+              className={`rounded-lg px-3 py-1.5 transition ${
+                meetingRole === "product_manager"
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-slate-600 hover:bg-slate-100"
+              }`}
+            >
+              Product Manager
+            </button>
+          </div>
+          <div className="mt-2 text-[11px] text-slate-600">
+            {getMeetingRoleDescription(meetingRole)}
+          </div>
+        </div>
+
+        <div className="meeting-section mb-4 rounded-xl p-3">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-700">
+            {meetingRole === "product_manager"
+              ? "Context Folders (for PM answers)"
+              : "RAG Folders (for interview answers)"}
           </div>
           <div className="space-y-1.5 text-xs text-slate-700">
             <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5">
@@ -3033,8 +3329,8 @@ If coding-related, preserve the original language and framework and include quic
           </div>
           <div className="mt-2 text-[11px] text-slate-600">
             {answerCaptureMode === "manual"
-              ? "AI answers only after you tap Record question and stop recording."
-              : "AI listens to the live transcript and answers when it detects a likely question."}
+              ? `AI answers only after you tap Record question and stop recording in ${getMeetingRoleLabel(meetingRole)} mode.`
+              : `AI listens to the live transcript and answers when it detects a likely ${getMeetingRoleLabel(meetingRole).toLowerCase()} question.`}
           </div>
         </div>
 
@@ -3095,7 +3391,7 @@ If coding-related, preserve the original language and framework and include quic
           className="app-btn app-btn-primary flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-rose-500 to-red-600 px-3 py-3 text-base text-white shadow-lg hover:from-rose-600 hover:to-red-700 disabled:cursor-not-allowed disabled:opacity-55"
         >
           <Mic className="h-3 w-3" />
-          Start Recording
+          Start {getMeetingRoleLabel(meetingRole)} Meeting
         </button>
 
         {logs.length > 0 && (
@@ -3122,6 +3418,10 @@ If coding-related, preserve the original language and framework and include quic
           <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-xs text-white">
             <Mic className="h-3 w-3 text-white" />
             <span className="font-semibold">{meeting?.title}</span>
+          </div>
+          <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-xs text-white">
+            <BriefcaseBusiness className="h-3 w-3 text-white" />
+            <span className="font-semibold">{getMeetingRoleLabel(meetingRole)}</span>
           </div>
           {meeting?.isRecording && (
             <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-xs text-white">
@@ -3223,7 +3523,21 @@ If coding-related, preserve the original language and framework and include quic
         >
           <div className="mb-2 flex items-center justify-between">
             <h3 className="meeting-transcript-title text-sm font-bold">Conversation</h3>
-            <span className="meeting-transcript-count text-xs">{meeting?.transcripts.length || 0} lines</span>
+            <div className="flex items-center gap-2">
+              {meeting?.isRecording && (
+                <button
+                  type="button"
+                  onClick={handleClearMeetingContext}
+                  disabled={isClearingContext}
+                  className={`meeting-answer-action-button meeting-answer-clear-button rounded border px-2 py-1 text-xs font-semibold transition ${
+                    isClearingContext ? "is-disabled cursor-not-allowed" : ""
+                  }`}
+                >
+                  {isClearingContext ? "Clearing..." : "Clear context"}
+                </button>
+              )}
+              <span className="meeting-transcript-count text-xs">{meeting?.transcripts.length || 0} lines</span>
+            </div>
           </div>
 
           {(!meeting || meeting.transcripts.length === 0) && !partialTranscript && !liveTranscript && (
@@ -3264,8 +3578,30 @@ If coding-related, preserve the original language and framework and include quic
 
         <div className="meeting-scroll-panel meeting-answer-panel max-h-[52vh] overflow-y-auto rounded-xl p-3">
           <div className="mb-2 flex items-center justify-between">
-            <h3 className="meeting-answer-title text-sm font-bold">AI Answers</h3>
+            <h3 className="meeting-answer-title text-sm font-bold">
+              {meetingRole === "product_manager" ? "PM Answers" : "AI Answers"}
+            </h3>
             <div className="meeting-answer-toolbar flex flex-wrap items-center justify-end gap-2">
+              <div className="meeting-answer-mode-toggle inline-flex rounded-lg p-0.5 text-xs font-semibold">
+                <button
+                  type="button"
+                  onClick={() => handleMeetingRoleChange("developer")}
+                  className={`meeting-answer-mode-button rounded-md px-2 py-1 transition ${
+                    meetingRole === "developer" ? "is-active" : ""
+                  }`}
+                >
+                  Developer
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleMeetingRoleChange("product_manager")}
+                  className={`meeting-answer-mode-button rounded-md px-2 py-1 transition ${
+                    meetingRole === "product_manager" ? "is-active" : ""
+                  }`}
+                >
+                  Product Manager
+                </button>
+              </div>
               <div className="meeting-answer-mode-toggle inline-flex rounded-lg p-0.5 text-xs font-semibold">
                 <button
                   type="button"
@@ -3315,14 +3651,18 @@ If coding-related, preserve the original language and framework and include quic
               <button
                 type="button"
                 onClick={handleAnswerFromScreen}
-                disabled={isScreenAnswering}
+                disabled={isScreenAnswering || meetingRole === "product_manager"}
                 className={`meeting-answer-action-button meeting-answer-screen-button rounded border px-2 py-1 text-xs font-semibold transition ${
-                  isScreenAnswering
+                  isScreenAnswering || meetingRole === "product_manager"
                     ? "is-disabled cursor-not-allowed"
                     : ""
                 }`}
               >
-                {isScreenAnswering ? "Analyzing screen..." : "Answer from screen"}
+                {meetingRole === "product_manager"
+                  ? "Screen Q&A (Dev only)"
+                  : isScreenAnswering
+                  ? "Analyzing screen..."
+                  : "Answer from screen"}
               </button>
               <span className="meeting-answer-count text-xs">{answers.length} items</span>
             </div>
@@ -3387,8 +3727,8 @@ If coding-related, preserve the original language and framework and include quic
               <p>No answers yet</p>
               <p className="meeting-answer-empty-subtext mt-1 text-xs">
                 {answerCaptureMode === "manual"
-                  ? "Manual mode is on. Record a question and stop to generate an answer."
-                  : "Answers appear when a likely interview question is detected."}
+                  ? `Manual mode is on. Record a question and stop to generate a ${getMeetingRoleLabel(meetingRole)} answer.`
+                  : `Answers appear when a likely ${getMeetingRoleLabel(meetingRole).toLowerCase()} question is detected.`}
               </p>
               {!hasInterviewerAudioRef.current && (
                 <p className="meeting-answer-empty-subtext mt-1 text-xs">Mic-only mode is active; question detection uses mic transcript.</p>
@@ -3412,12 +3752,12 @@ If coding-related, preserve the original language and framework and include quic
                         {formatIntentLabel(item.responseMetadata?.intent || item.intent)}
                       </div>
                     )}
-                    {(item.responseMetadata?.language || item.languageHint) && (
+                    {item.role !== "product_manager" && (item.responseMetadata?.language || item.languageHint) && (
                       <div className="meeting-answer-badge is-language inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold">
                         {item.responseMetadata?.language || item.languageHint}
                       </div>
                     )}
-                    {(item.responseMetadata?.framework || item.frameworkHint) && (
+                    {item.role !== "product_manager" && (item.responseMetadata?.framework || item.frameworkHint) && (
                       <div className="meeting-answer-badge is-framework inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold">
                         {item.responseMetadata?.framework || item.frameworkHint}
                       </div>
@@ -3466,7 +3806,7 @@ If coding-related, preserve the original language and framework and include quic
                       </div>
                       {renderAnswerContent(item)}
 
-                      {(item.responseMetadata?.framework ||
+                      {item.role !== "product_manager" && (item.responseMetadata?.framework ||
                         item.responseMetadata?.approach ||
                         item.responseMetadata?.timeComplexity ||
                         item.responseMetadata?.spaceComplexity) && (

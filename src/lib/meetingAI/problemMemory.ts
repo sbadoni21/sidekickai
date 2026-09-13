@@ -1,6 +1,7 @@
 import type { CodingQuestionUnderstanding } from "../meetingsStore"
 import type {
   CodingIntent,
+  MeetingRole,
   ProblemMemory,
   QuestionCandidate,
   ScreenProblemAnalysis
@@ -256,6 +257,44 @@ export const inferCodingIntent = (question: string, contextWindow = ""): CodingI
   }
 
   return "other"
+}
+
+const inferProductManagerIntent = (question: string, contextWindow = ""): CodingIntent => {
+  const haystack = `${question}\n${contextWindow}`.toLowerCase()
+
+  if (
+    /\b(tell me about a time|describe a time|walk me through a time|conflict|influence|stakeholder management|cross-functional|leadership|disagreement|ambiguity|ownership|alignment)\b/i.test(
+      haystack
+    )
+  ) {
+    return "behavioral"
+  }
+
+  if (
+    /\b(prioriti[sz]e|prioritization|roadmap|north star|metric|kpi|retention|activation|engagement|conversion|funnel|churn|launch|mvp|go to market|gtm|experiments?|a\/b|user segment|persona|customer pain|pricing|feature|backlog|product strategy|product sense|what would you build|how would you improve|success metric)\b/i.test(
+      haystack
+    )
+  ) {
+    return "system_design"
+  }
+
+  if (/\b(explain|difference|what is|how would you measure|how do you measure|why|clarify|compare)\b/i.test(haystack)) {
+    return "clarify"
+  }
+
+  return "other"
+}
+
+export const inferMeetingIntent = (
+  question: string,
+  contextWindow = "",
+  role: MeetingRole = "developer"
+): CodingIntent => {
+  if (role === "product_manager") {
+    return inferProductManagerIntent(question, contextWindow)
+  }
+
+  return inferCodingIntent(question, contextWindow)
 }
 
 export const isCodeHeavyIntent = (intent: CodingIntent): boolean =>

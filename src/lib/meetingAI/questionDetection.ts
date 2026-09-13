@@ -1,6 +1,11 @@
 import type { CodingQuestionUnderstanding } from "../meetingsStore"
-import type { ModelQuestionClassification, QuestionCandidate, MeetingAudioSource } from "./types"
-import { inferCodingIntent, inferFrameworkFromText, inferLanguageFromText } from "./problemMemory"
+import type {
+  ModelQuestionClassification,
+  QuestionCandidate,
+  MeetingAudioSource,
+  MeetingRole
+} from "./types"
+import { inferFrameworkFromText, inferLanguageFromText, inferMeetingIntent } from "./problemMemory"
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
 
@@ -9,6 +14,13 @@ const DEFAULT_EDGE_CASES = [
   "single element",
   "duplicates",
   "maximum constraint boundary"
+]
+
+const DEFAULT_PM_EDGE_CASES = [
+  "user adoption risk",
+  "stakeholder alignment",
+  "technical dependency",
+  "measurement ambiguity"
 ]
 
 const stopWords = new Set([
@@ -71,6 +83,8 @@ const questionSignalRegex =
   /\b(explain|describe|walk me through|tell me|give me|compare|difference|trade-?off|approach|design|implement|optimi[sz]e|debug|why|how|what)\b/i
 const technicalSignalRegex =
   /\b(array|string|graph|tree|heap|stack|queue|hash|map|set|dp|dynamic programming|greedy|binary search|two pointer|sliding window|sort|time complexity|space complexity|big o|edge case|constraints?|algorithm|data structure|api|database|schema|query|endpoint|auth|token|latency|throughput|memory|cpu|index|pipeline)\b/i
+const productSignalRegex =
+  /\b(product|roadmap|prioriti[sz]e|prioritization|metric|kpi|north star|retention|activation|engagement|conversion|funnel|churn|launch|mvp|go to market|gtm|user|customer|persona|segment|experiment|a\/b|stakeholder|adoption|pricing|feature|backlog|strategy|trade-?off)\b/i
 const transformSignalRegex =
   /\b(convert|conversion|transform|map|parse|serialize|deserialize|normalize|format|cast|truncate|migrate)\b/i
 const identifierSignalRegex = /\b(id|identifier|uuid|primary key|foreign key)\b/i
@@ -78,6 +92,8 @@ const numericTransformSignalRegex =
   /\b(from|to|into|between|vs|versus)\b.*\b\d+\b|\b\d+\b.*\b(from|to|into|between|vs|versus)\b/i
 const problemStatementRegex =
   /\b(you are given|given an? (integer|array|string|graph|tree)|group size|return (true|false)|consecutive|divide the array|can be divided|output|find|determine)\b/i
+const productProblemStatementRegex =
+  /\b(design a product|how would you improve|what would you build|how would you prioriti[sz]e|which feature|what metric|how do you measure|why did adoption|should we launch|target user|customer problem|go to market)\b/i
 const followUpRegex = /^(and|also|then|what about|how about|plus|one more|another)\b/i
 const nonQuestionFillerRegex = /^(ok|okay|right|sure|thanks|great|cool|nice|yep|yeah|hmm|uh|um)\b/i
 const confirmationTailRegex = /\b(right|all right|ok|okay|correct)\?*$/i
@@ -108,7 +124,8 @@ export const normalizeQuestionSignature = (text: string): string =>
 
 export const buildQuestionUnderstanding = (
   question: string,
-  contextWindow: string
+  contextWindow: string,
+  role: MeetingRole = "developer"
 ): CodingQuestionUnderstanding => {
   const normalizedQuestion = question.replace(/\s+/g, " ").trim()
   const sourceText = `${contextWindow}\n${normalizedQuestion}`.toLowerCase()
@@ -129,7 +146,7 @@ export const buildQuestionUnderstanding = (
   return {
     problemStatement: problemStatement || normalizedQuestion,
     constraints,
-    edgeCases: edgeCases.length > 0 ? edgeCases : DEFAULT_EDGE_CASES
+    edgeCases: edgeCases.length > 0 ? edgeCases : role === "product_manager" ? DEFAULT_PM_EDGE_CASES : DEFAULT_EDGE_CASES
   }
 }
 
@@ -160,7 +177,7 @@ const splitTranscriptIntoCandidates = (text: string): string[] => {
   return unique.length > 0 ? unique : [normalized]
 }
 
-const scoreQuestionConfidence = (text: string): number => {
+const scoreQuestionConfidence = (text: string, role: MeetingRole = "developer"): number => {
   const normalized = text.replace(/\s+/g, " ").trim()
   if (!normalized) return 0
 
@@ -170,15 +187,19 @@ const scoreQuestionConfidence = (text: string): number => {
   const hasEmbeddedCue = !hasStarter && questionCueAnywhereRegex.test(normalized)
   const hasQuestionSignal = questionSignalRegex.test(normalized)
   const hasTechnicalSignal = technicalSignalRegex.test(normalized)
+  const hasProductSignal = productSignalRegex.test(normalized)
   const hasTransformSignal = transformSignalRegex.test(normalized)
   const hasIdentifierSignal = identifierSignalRegex.test(normalized)
   const hasNumericTransformSignal = numericTransformSignalRegex.test(normalized)
+  const hasRoleSignal = role === "product_manager" ? hasProductSignal : hasTechnicalSignal
   const hasSignal =
     hasQuestionSignal ||
-    hasTechnicalSignal ||
+    hasRoleSignal ||
     hasTransformSignal ||
     (hasIdentifierSignal && hasNumericTransformSignal)
   const hasProblemStatement = problemStatementRegex.test(normalized)
+  const hasProductProblemStatement = productProblemStatementRegex.test(normalized)
+  const hasRoleProblemStatement = role === "product_manager" ? hasProductProblemStatement : hasProblemStatement
   const hasConfirmationTail = confirmationTailRegex.test(normalized)
 
   let score = 0
@@ -186,31 +207,39 @@ const scoreQuestionConfidence = (text: string): number => {
   if (hasStarter) score += 0.32
   if (hasEmbeddedCue) score += 0.24
   if (hasQuestionSignal) score += 0.18
-  if (hasTechnicalSignal) score += 0.15
+  if (hasTechnicalSignal) score += role === "product_manager" ? 0.05 : 0.15
+  if (hasProductSignal) score += role === "product_manager" ? 0.18 : 0.05
   if (hasTransformSignal) score += 0.12
   if (hasIdentifierSignal) score += 0.08
   if (hasNumericTransformSignal) score += 0.1
-  if (hasProblemStatement) score += 0.32
+  if (hasRoleProblemStatement) score += 0.32
   if (followUpRegex.test(normalized)) score += 0.12
   if (words.length >= 7 && words.length <= 30) score += 0.1
   if (words.length > 45) score -= 0.05
   if (words.length < 6) score -= 0.25
   if (nonQuestionFillerRegex.test(normalized) && words.length <= 5) score -= 0.4
   if (hasConfirmationTail) score -= 0.45
-  if (!hasStarter && !hasSignal && !hasQuestionMark && !hasProblemStatement) score -= 0.25
+  if (!hasStarter && !hasSignal && !hasQuestionMark && !hasRoleProblemStatement) score -= 0.25
   return clamp01(score)
 }
 
-export const getQuestionDetectionThreshold = (question: string): number => {
+export const getQuestionDetectionThreshold = (
+  question: string,
+  role: MeetingRole = "developer"
+): number => {
   const normalized = question.replace(/\s+/g, " ").trim()
   const hasStarter = questionStarterRegex.test(normalized)
+  const hasProductSignal = productSignalRegex.test(normalized)
   const hasSignal =
     questionSignalRegex.test(normalized) ||
-    technicalSignalRegex.test(normalized) ||
+    (role === "product_manager" ? hasProductSignal : technicalSignalRegex.test(normalized)) ||
     transformSignalRegex.test(normalized) ||
     (identifierSignalRegex.test(normalized) && numericTransformSignalRegex.test(normalized))
   const hasQuestionMark = normalized.endsWith("?")
-  const hasProblemStatement = problemStatementRegex.test(normalized)
+  const hasProblemStatement =
+    role === "product_manager"
+      ? productProblemStatementRegex.test(normalized)
+      : problemStatementRegex.test(normalized)
 
   if (hasProblemStatement) return 0.42
   if (hasQuestionMark && (hasStarter || hasSignal)) return 0.46
@@ -220,30 +249,39 @@ export const getQuestionDetectionThreshold = (question: string): number => {
   return 0.62
 }
 
-export const isLikelyInterviewQuestion = (question: string, confidence: number): boolean => {
+export const isLikelyInterviewQuestion = (
+  question: string,
+  confidence: number,
+  role: MeetingRole = "developer"
+): boolean => {
   const normalized = question.replace(/\s+/g, " ").trim()
   const words = normalized.split(" ").filter(Boolean)
   const hasStarter = questionStarterRegex.test(normalized)
+  const hasProductSignal = productSignalRegex.test(normalized)
   const hasSignal =
     questionSignalRegex.test(normalized) ||
-    technicalSignalRegex.test(normalized) ||
+    (role === "product_manager" ? hasProductSignal : technicalSignalRegex.test(normalized)) ||
     transformSignalRegex.test(normalized) ||
     (identifierSignalRegex.test(normalized) && numericTransformSignalRegex.test(normalized))
   const hasQuestionMark = normalized.endsWith("?")
-  const hasProblemStatement = problemStatementRegex.test(normalized)
+  const hasProblemStatement =
+    role === "product_manager"
+      ? productProblemStatementRegex.test(normalized)
+      : problemStatementRegex.test(normalized)
   const confirmationOnly = confirmationTailRegex.test(normalized) && words.length <= 12
 
   if (confirmationOnly && !hasStarter) return false
   if (!hasStarter && !hasSignal && !hasQuestionMark && !hasProblemStatement) return false
   if (words.length < 5 && !hasStarter && !hasQuestionMark) return false
-  if (confidence < getQuestionDetectionThreshold(normalized)) return false
+  if (confidence < getQuestionDetectionThreshold(normalized, role)) return false
   return true
 }
 
 export const buildHeuristicQuestionCandidate = (
   text: string,
   source: MeetingAudioSource,
-  contextWindow: string
+  contextWindow: string,
+  role: MeetingRole = "developer"
 ): QuestionCandidate | null => {
   const segments = splitTranscriptIntoCandidates(text)
   if (segments.length === 0) return null
@@ -252,7 +290,7 @@ export const buildHeuristicQuestionCandidate = (
   let bestScore = 0
   segments.forEach((segment, index) => {
     const positionBoost = ((index + 1) / Math.max(segments.length, 1)) * 0.03
-    const score = clamp01(scoreQuestionConfidence(segment) + positionBoost)
+    const score = clamp01(scoreQuestionConfidence(segment, role) + positionBoost)
     if (score > bestScore) {
       bestScore = score
       bestQuestion = segment
@@ -260,16 +298,17 @@ export const buildHeuristicQuestionCandidate = (
   })
 
   if (!bestQuestion) return null
-  if (!isLikelyInterviewQuestion(bestQuestion, bestScore)) return null
+  if (!isLikelyInterviewQuestion(bestQuestion, bestScore, role)) return null
 
   return {
     id: `question-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
     question: bestQuestion,
     source,
+    role,
     confidence: bestScore,
     contextWindow,
     detectedAt: Date.now(),
-    understanding: buildQuestionUnderstanding(bestQuestion, contextWindow)
+    understanding: buildQuestionUnderstanding(bestQuestion, contextWindow, role)
   }
 }
 
@@ -331,9 +370,43 @@ const normalizeIntentLabel = (value: unknown): ModelQuestionClassification["inte
 
 export const classifyQuestionIntentWithModel = async (
   candidate: QuestionCandidate,
-  invokeLlm: (prompt: string) => Promise<string>
+  invokeLlm: (prompt: string) => Promise<string>,
+  role: MeetingRole = candidate.role || "developer"
 ): Promise<ModelQuestionClassification> => {
-  const prompt = `You are a strict intent classifier for live interview transcripts.
+  const prompt = role === "product_manager"
+    ? `You are a strict intent classifier for live Product Manager interview transcripts.
+Return STRICT JSON only.
+
+Transcript source: ${candidate.source}
+Candidate question text: """${candidate.question}"""
+Recent context:
+${candidate.contextWindow || "No context"}
+
+Return:
+{
+  "is_question": true,
+  "confidence": 0.0,
+  "normalized_question": "single cleaned question",
+  "question_type": "product-sense|product-strategy|execution|behavioral|clarification|other",
+  "intent": "behavioral|system_design|clarify|other",
+  "language_hint": "none",
+  "framework_hint": "none",
+  "rationale": "short reason",
+  "question_understanding": {
+    "problem_statement": "normalized product question",
+    "constraints": ["..."],
+    "edge_cases": ["..."]
+  }
+}
+
+Rules:
+- Treat product sense, prioritization, roadmap, metrics, execution, experimentation, GTM, and stakeholder-management prompts as valid PM interview questions.
+- Use "system_design" for structured PM answers about product strategy, feature prioritization, product design, metrics, launches, or tradeoffs.
+- Use "behavioral" for past-experience, leadership, conflict, ownership, or influence questions.
+- Use "clarify" for short conceptual definitions or comparisons.
+- If uncertain, lower confidence instead of hallucinating.
+- confidence must be in [0,1].`
+    : `You are a strict intent classifier for live interview transcripts.
 Return STRICT JSON only.
 
 Transcript source: ${candidate.source}
@@ -386,7 +459,7 @@ Rules:
     const intent =
       typeof parsed?.intent === "string" && parsed.intent.trim()
         ? normalizeIntentLabel(parsed.intent)
-        : inferCodingIntent(normalizedQuestion, candidate.contextWindow)
+        : inferMeetingIntent(normalizedQuestion, candidate.contextWindow, role)
     const languageHint =
       typeof parsed?.language_hint === "string" && parsed.language_hint.trim()
         ? inferLanguageFromText(parsed.language_hint.trim())
@@ -416,11 +489,11 @@ Rules:
     }
   } catch {
     return {
-      isQuestion: isLikelyInterviewQuestion(candidate.question, candidate.confidence),
+      isQuestion: isLikelyInterviewQuestion(candidate.question, candidate.confidence, role),
       confidence: candidate.confidence,
       normalizedQuestion: candidate.question,
       questionType: "other",
-      intent: inferCodingIntent(candidate.question, candidate.contextWindow),
+      intent: inferMeetingIntent(candidate.question, candidate.contextWindow, role),
       languageHint: inferLanguageFromText(`${candidate.question}\n${candidate.contextWindow}`),
       frameworkHint: inferFrameworkFromText(`${candidate.question}\n${candidate.contextWindow}`),
       understanding: fallbackUnderstanding
